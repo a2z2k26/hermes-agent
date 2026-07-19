@@ -2449,6 +2449,21 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Interlocutor capability policy. Disabled by default: existing messaging
+    # allowlists still decide who may talk to the bot; this optional layer can
+    # mark selected Discord users as operator or chat-only for runtime guardrails.
+    "interlocutor_policy": {
+        "enabled": False,
+        "audit_log_enabled": True,
+        "audit_log_path": "~/.hermes/policy/interlocutor-events.jsonl",
+        "operator_user_ids": [],
+        "chat_only_user_ids": [],
+        "chat_only_default_response": (
+            "I can talk generally, but private information or substantial "
+            "actions need Andrew's approval."
+        ),
+    },
+
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {

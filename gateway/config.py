@@ -955,6 +955,11 @@ class GatewayConfig:
     # dict with: name, platform, profile, and optional guild_id/chat_id/thread_id.
     profile_routes: list = field(default_factory=list)
 
+    # Optional second-layer capability policy for messaging interlocutors.
+    # Existing platform allowlists still decide who may talk to the bot; this
+    # dict is disabled by default and interpreted by gateway.interlocutor_policy.
+    interlocutor_policy: Dict[str, Any] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(
             self.systemd_watchdog_seconds
@@ -1079,6 +1084,7 @@ class GatewayConfig:
                 asdict(r) if is_dataclass(r) and not isinstance(r, type) else r
                 for r in self.profile_routes
             ],
+            "interlocutor_policy": dict(self.interlocutor_policy),
         }
     
     @classmethod
@@ -1214,6 +1220,7 @@ class GatewayConfig:
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=profile_routes,
+            interlocutor_policy=_coerce_dict(data.get("interlocutor_policy", {})),
         )
 
     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
@@ -1358,6 +1365,12 @@ def load_gateway_config() -> GatewayConfig:
                 _pr = gateway_section.get("profile_routes")
             if isinstance(_pr, list):
                 gw_data["profile_routes"] = _pr
+
+            _ip = yaml_cfg.get("interlocutor_policy")
+            if _ip is None and isinstance(gateway_section, dict):
+                _ip = gateway_section.get("interlocutor_policy")
+            if isinstance(_ip, dict):
+                gw_data["interlocutor_policy"] = _ip
 
             if isinstance(gateway_section, dict):
                 if "multiplex_profiles" in gateway_section and "multiplex_profiles" not in gw_data:
