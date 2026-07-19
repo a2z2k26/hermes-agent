@@ -639,6 +639,11 @@ class GatewayConfig:
         "loop_watchdog_max_strikes", "unauthorized_dm_behavior", "unauthorized_dm_decline_message",
     )
 
+    # Optional second-layer capability policy for messaging interlocutors.
+    # Existing platform allowlists still decide who may talk to the bot; this
+    # dict is disabled by default and interpreted by gateway.interlocutor_policy.
+    interlocutor_policy: Dict[str, Any] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(self.systemd_watchdog_seconds)
 
@@ -704,6 +709,7 @@ class GatewayConfig:
                 if is_dataclass(r) and not isinstance(r, type) else r
                 for r in self.profile_routes
             ],
+            "interlocutor_policy": dict(self.interlocutor_policy),
         }
 
     @classmethod
@@ -790,6 +796,7 @@ class GatewayConfig:
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=parse_profile_routes(data.get("profile_routes") or []),
+            interlocutor_policy=_coerce_dict(data.get("interlocutor_policy", {})),
         )
 
     def _extra_choice(self, platform: Optional[Platform], key: str, choices: set, default: str) -> Optional[str]:

@@ -2065,6 +2065,20 @@ DEFAULT_CONFIG = {
         # secret values); values are read from the environment at export time.
         "export": {"otlp": {"enabled": False, "endpoint": "", "headers_env": {}}},
     },
+    # Interlocutor capability policy (fleet 8a732a8a66). Disabled by default: existing messaging
+    # allowlists still decide who may talk to the bot; this optional layer can mark selected
+    # Discord users as operator or chat-only for runtime guardrails.
+    "interlocutor_policy": {
+        "enabled": False,
+        "audit_log_enabled": True,
+        "audit_log_path": "~/.hermes/policy/interlocutor-events.jsonl",
+        "operator_user_ids": [],
+        "chat_only_user_ids": [],
+        "chat_only_default_response": (
+            "I can talk generally, but private information or substantial "
+            "actions need Andrew's approval."
+        ),
+    },
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
         # Seconds to let a SIGTERM-interrupted gateway agent unwind before adapter/database
         # teardown. Keep short so service-manager shutdowns don't exhaust their stop budget.

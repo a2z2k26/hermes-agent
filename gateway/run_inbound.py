@@ -281,6 +281,46 @@ class GatewayInboundMixin:
                 return True
         return False
 
+    async def _hm_interlocutor_policy_blocked(
+        self, event: "MessageEvent", source: SessionSource, is_internal: bool
+    ) -> bool:
+        """Fleet interlocutor capability guard (ported from fleet 8a732a8a66, formerly inline in
+        run.py ``_handle_message``). True = blocked: the policy response was sent and the turn ends."""
+        if is_internal:
+            return False
+        _policy_cfg = None
+        _policy_audit_writer = None
+        try:
+            from gateway.interlocutor_policy import (
+                InterlocutorPolicyConfig,
+                evaluate_interlocutor_policy,
+                write_policy_audit_event as _write_policy_audit_event,
+            )
+            _policy_cfg = InterlocutorPolicyConfig.from_mapping(
+                getattr(self.config, "interlocutor_policy", {}))
+            _policy_audit_writer = _write_policy_audit_event
+            _policy_decision = evaluate_interlocutor_policy(event, _policy_cfg)
+        except Exception as _policy_exc:
+            logger.warning("interlocutor policy evaluation failed: %s", _policy_exc)
+            _policy_decision = None
+        if _policy_decision is None or _policy_decision.allowed:
+            return False
+        logger.info(
+            "interlocutor policy blocked message: platform=%s user=%s intent=%s",
+            source.platform.value if source.platform else "unknown",
+            source.user_id or "unknown",
+            getattr(_policy_decision.intent, "value", _policy_decision.intent),
+        )
+        adapter = self._delivery_adapter_for(source)
+        if adapter and _policy_decision.response:
+            await adapter.send(str(source.chat_id), _policy_decision.response)
+        try:
+            if _policy_audit_writer is not None and _policy_cfg is not None:
+                _policy_audit_writer(event=event, config=_policy_cfg, decision=_policy_decision)
+        except Exception as _audit_exc:
+            logger.warning("interlocutor policy audit logging failed: %s", _audit_exc)
+        return True
+
     def _hm_estop_gate(
         self, event: "MessageEvent", source: SessionSource, is_internal: bool
     ) -> Optional[str]:
@@ -1287,6 +1327,11 @@ class GatewayInboundMixin:
         # — Discord interaction passthrough builds its own MessageEvent and
         # calls handle_message directly, so a teardown on the relay's inbound
         # handler left those turns muted.
+
+        # Fleet interlocutor guard (8a732a8a66): after auth, before the estop gate, so
+        # policy-blocked senders cannot probe pause state. Disabled by default.
+        if await self._hm_interlocutor_policy_blocked(event, source, is_internal):
+            return None
 
         _paused_notice = self._hm_estop_gate(event, source, is_internal)
         if _paused_notice is not None:
