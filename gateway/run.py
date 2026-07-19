@@ -16900,12 +16900,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
 
+        if not is_internal:
+            _policy_cfg = None
+            _policy_audit_writer = None
+            try:
+                from gateway.interlocutor_policy import (
+                    InterlocutorPolicyConfig,
+                    evaluate_interlocutor_policy,
+                    write_policy_audit_event as _write_policy_audit_event,
+                )
+                _policy_cfg = InterlocutorPolicyConfig.from_mapping(
+                    getattr(self.config, "interlocutor_policy", {})
+                )
+                _policy_audit_writer = _write_policy_audit_event
+                _policy_decision = evaluate_interlocutor_policy(event, _policy_cfg)
+            except Exception as _policy_exc:
+                logger.warning("interlocutor policy evaluation failed: %s", _policy_exc)
+                _policy_decision = None
+            if _policy_decision is not None and not _policy_decision.allowed:
+                logger.info(
+                    "interlocutor policy blocked message: platform=%s user=%s intent=%s",
+                    source.platform.value if source.platform else "unknown",
+                    source.user_id or "unknown",
+                    getattr(_policy_decision.intent, "value", _policy_decision.intent),
+                )
+                adapter = self._adapter_for_source(source)
+                if adapter and _policy_decision.response:
+                    await adapter.send(str(source.chat_id), _policy_decision.response)
+                try:
+                    if _policy_audit_writer is not None and _policy_cfg is not None:
+                        _policy_audit_writer(
+                            event=event,
+                            config=_policy_cfg,
+                            decision=_policy_decision,
+                        )
+                except Exception as _audit_exc:
+                    logger.warning("interlocutor policy audit logging failed: %s", _audit_exc)
+                return None
+
         # Global emergency stop (`hermes pause`): give new turns a brief
         # paused notice instead of starting an agent run. Internal events
         # (background-process completions from IN-FLIGHT work) bypass the
         # gate — pause stops NEW work, it never kills or orphans running
-        # work. Placed after auth so unauthorized senders keep the normal
-        # silent/pairing behavior and can't probe pause state.
+        # work. Placed after auth and interlocutor-policy evaluation so
+        # unauthorized or policy-blocked senders keep the normal behavior and
+        # cannot probe pause state.
         #
         # Passthroughs (pause blocks new AGENT turns, not control traffic):
         #   * recognized slash commands — /status, /help, /new, /approve and
