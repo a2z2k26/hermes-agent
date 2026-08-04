@@ -84,10 +84,15 @@ from gateway.platforms.base import (
 from gateway.config import Platform
 
 
-# Buzz chat messages are Nostr kind 9 events.  ``buzz messages get`` also
-# returns housekeeping kinds (joins, canvas updates, …) — only kind 9 is
-# dispatched to the agent.
+# Buzz chat messages are Nostr kind 9 events. Huddle lifecycle events are
+# consumed by the adapter so it can join/leave ephemeral Huddle backing
+# channels; only kind 9 is dispatched to the agent.
 _CHAT_KIND = 9
+_HUDDLE_STARTED_KIND = 48100
+_HUDDLE_ENDED_KIND = 48103
+_HUDDLE_GUIDELINES_KIND = 48106
+_ADD_MEMBER_KIND = 9000
+_INBOUND_KINDS = [_CHAT_KIND, _HUDDLE_STARTED_KIND, _HUDDLE_ENDED_KIND, _HUDDLE_GUIDELINES_KIND, _ADD_MEMBER_KIND]
 # How many events to request per poll / seed call.
 _FETCH_LIMIT = 50
 # Bound on the per-channel de-dupe set (events, not bytes).
@@ -98,13 +103,17 @@ _DM_DISCOVERY_EVERY = 5
 
 _DEFAULT_POLL_INTERVAL = 4.0
 _MIN_POLL_INTERVAL = 1.0
+_DEFAULT_PRESENCE_INTERVAL = 60.0
+_MIN_PRESENCE_INTERVAL = 10.0
 _CLI_TIMEOUT = 30.0
 
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
-# kind 44100 is Buzz's channel-membership event — used for live DM discovery.
+# kind 9000 is Buzz's add-member event; older hosted relays may also emit
+# kind 44100 sidecar membership notifications. Subscribe to both so joined
+# channels, DMs, and huddle backing channels added mid-run are discovered.
 _WS_AUTH_TIMEOUT = 20.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
-_WS_MEMBERSHIP_KIND = 44100
+_WS_MEMBERSHIP_KINDS = [9000, 44100]
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
 
 # Where to look for a credentials JSON (keys: nsec / private_key_hex) when
@@ -392,6 +401,52 @@ class BuzzAdapter(BasePlatformAdapter):
             _rm_cfg = _rm_raw
         self.require_mention = str(_rm_cfg).strip().lower() not in ("false", "0", "no", "off")
 
+        # Buzz renders --reply-to as a nested reply card rather than a normal
+        # chat-line response. Keep Hermes responses in the main chat by
+        # default; deployments that explicitly want threaded replies can opt in
+        # with config extra.reply_to_messages=true.
+        self.reply_to_messages = str(extra.get("reply_to_messages", False)).strip().lower() in (
+            "true",
+            "1",
+            "yes",
+            "on",
+        )
+
+        # Presence is an ephemeral relay lease separate from the message
+        # WebSocket subscription. Renew it while the gateway is healthy so
+        # Buzz Desktop can show the agent as online/available.
+        _presence_raw = os.getenv("BUZZ_PRESENCE_ENABLED")
+        if _presence_raw is None:
+            _presence_cfg = extra.get("presence_enabled", True)
+        else:
+            _presence_cfg = _presence_raw
+        self.presence_enabled = str(_presence_cfg).strip().lower() not in (
+            "false",
+            "0",
+            "no",
+            "off",
+        )
+        try:
+            presence_interval = float(
+                os.getenv("BUZZ_PRESENCE_INTERVAL")
+                or extra.get("presence_interval", _DEFAULT_PRESENCE_INTERVAL)
+            )
+        except (TypeError, ValueError):
+            presence_interval = _DEFAULT_PRESENCE_INTERVAL
+        self.presence_interval = max(_MIN_PRESENCE_INTERVAL, presence_interval)
+
+        _huddle_raw = os.getenv("BUZZ_AUTO_JOIN_HUDDLES")
+        if _huddle_raw is None:
+            _huddle_cfg = extra.get("auto_join_huddles", True)
+        else:
+            _huddle_cfg = _huddle_raw
+        self.auto_join_huddles = str(_huddle_cfg).strip().lower() not in (
+            "false",
+            "0",
+            "no",
+            "off",
+        )
+
         # Inbound transport: "auto" (WebSocket with poll fallback, default),
         # "websocket" (require WS; fail connect when it can't authenticate),
         # or "poll" (CLI polling only). Env (BUZZ_TRANSPORT) overrides
@@ -423,6 +478,7 @@ class BuzzAdapter(BasePlatformAdapter):
 
         # Runtime state
         self._poll_task: Optional[asyncio.Task] = None
+        self._presence_task: Optional[asyncio.Task] = None
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_ready: Optional[asyncio.Event] = None
         self._ws_active = False  # True while the WS loop owns inbound delivery
@@ -557,6 +613,9 @@ class BuzzAdapter(BasePlatformAdapter):
         if transport_used == "poll":
             self._poll_task = asyncio.create_task(self._poll_loop())
         self._mark_connected()
+        if self.presence_enabled:
+            await self._publish_presence("online")
+            self._presence_task = asyncio.create_task(self._presence_loop())
         logger.info(
             "Buzz: connected to %s as %s, watching %d channel(s) via %s%s",
             self.relay_url,
@@ -567,9 +626,35 @@ class BuzzAdapter(BasePlatformAdapter):
         )
         return True
 
+    async def _publish_presence(self, status: str) -> None:
+        """Publish Buzz presence best-effort without affecting connection health."""
+        if not self.presence_enabled or not self.cli_path:
+            return
+        code, _out, err = await self._run_cli(["users", "set-presence", "--status", status])
+        if code != 0:
+            logger.debug("Buzz: failed to publish %s presence — %s", status, _cli_error_message(err, code))
+
+    async def _presence_loop(self) -> None:
+        """Renew ephemeral online presence while the gateway is running."""
+        try:
+            while True:
+                await asyncio.sleep(self.presence_interval)
+                await self._publish_presence("online")
+        except asyncio.CancelledError:
+            raise
+
     async def disconnect(self) -> None:
         """Stop the inbound transport and drop runtime state."""
         self._mark_disconnected()
+        if self._presence_task and not self._presence_task.done():
+            self._presence_task.cancel()
+            try:
+                await self._presence_task
+            except asyncio.CancelledError:
+                pass
+        self._presence_task = None
+        if self.presence_enabled and self._private_key and self.cli_path:
+            await self._publish_presence("offline")
         lock_key = getattr(self, "_lock_key", None)
         if lock_key:
             try:
@@ -610,7 +695,7 @@ class BuzzAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
         reply_target = reply_to or (metadata or {}).get("thread_id")
-        if reply_target:
+        if self.reply_to_messages and reply_target:
             args += ["--reply-to", str(reply_target)]
         code, out, err = await self._run_cli(args, input_text=content)
         if code != 0:
@@ -796,7 +881,7 @@ class BuzzAdapter(BasePlatformAdapter):
         request = [
             "REQ",
             subscription_id,
-            {"kinds": [_CHAT_KIND], "#h": [channel_id], "since": since},
+            {"kinds": _INBOUND_KINDS, "#h": [channel_id], "since": since},
         ]
         await websocket.send(json.dumps(request, separators=(",", ":")))
 
@@ -813,7 +898,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 "REQ",
                 _WS_MEMBERSHIP_SUB_ID,
                 {
-                    "kinds": [_WS_MEMBERSHIP_KIND],
+                    "kinds": _WS_MEMBERSHIP_KINDS,
                     "#p": [self._self_pubkey],
                     "since": max(self._membership_since - 1, 0),
                 },
@@ -823,18 +908,21 @@ class BuzzAdapter(BasePlatformAdapter):
         return subscriptions
 
     async def _handle_membership_event(self, websocket, subscriptions: Dict[str, Optional[str]], event: dict) -> None:
-        """A membership event p-tagged to us: rediscover conversations and
-        subscribe to any new ones (fresh DMs dispatch from their beginning)."""
-        self._membership_since = max(self._membership_since, int(event.get("created_at") or 0))
+        """A membership event p-tagged to us: discover and subscribe to any
+        newly joined conversations, including normal channels and huddle
+        ephemeral backing channels added while the gateway is running."""
+        membership_ts = int(event.get("created_at") or time.time())
+        self._membership_since = max(self._membership_since, membership_ts)
         before = set(self._channel_state)
+        await self._discover_joined_channels(seed=False, initial_last_ts=max(membership_ts - 1, 0))
         await self._discover_dms(seed=False)
         for channel_id in self._channel_state:
             if channel_id in before:
                 continue
-            subscription_id = f"hermes-buzz-dm-{len(subscriptions)}"
+            subscription_id = f"hermes-buzz-joined-{len(subscriptions)}"
             subscriptions[subscription_id] = channel_id
             await self._send_channel_subscription(websocket, subscription_id, channel_id)
-            logger.info("Buzz: subscribed to new conversation %s", channel_id)
+            logger.info("Buzz: subscribed to newly joined conversation %s", channel_id)
 
     async def _websocket_loop(self) -> None:
         """Persistent authenticated subscription with bounded reconnect
@@ -881,8 +969,16 @@ class BuzzAdapter(BasePlatformAdapter):
                                 channel_id = subscriptions.get(subscription_id)
                                 state = self._channel_state.get(channel_id or "")
                                 if channel_id and state is not None:
+                                    before_channels = set(self._channel_state)
                                     await self._handle_event(channel_id, state, event)
                                     self._trim_seen(state)
+                                    for new_channel_id in self._channel_state:
+                                        if new_channel_id in before_channels:
+                                            continue
+                                        subscription_id = f"hermes-buzz-huddle-{len(subscriptions)}"
+                                        subscriptions[subscription_id] = new_channel_id
+                                        await self._send_channel_subscription(websocket, subscription_id, new_channel_id)
+                                        logger.info("Buzz: subscribed to Huddle conversation %s", new_channel_id)
                             elif message[0] == "CLOSED":
                                 detail = message[-1] if len(message) > 2 else "subscription closed"
                                 raise ConnectionError(str(detail))
@@ -908,6 +1004,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 self._poll_count += 1
                 try:
                     if self._poll_count % _DM_DISCOVERY_EVERY == 0:
+                        await self._discover_joined_channels(seed=False, initial_last_ts=int(time.time()) - 1)
                         await self._discover_dms(seed=False)
                     for channel_id in list(self._channel_state):
                         await self._poll_channel(channel_id)
@@ -944,6 +1041,38 @@ class BuzzAdapter(BasePlatformAdapter):
             # so it bypasses the mention gate from the very first poll.
             self._maybe_latch_dm(channel_id, state, event)
         self._trim_seen(state)
+
+    async def _discover_joined_channels(self, *, seed: bool, initial_last_ts: int = 0) -> None:
+        """Discover newly joined Buzz channels while running.
+
+        Empty ``self.channels`` means "all joined channels". A membership
+        event can add a regular channel or a huddle's ephemeral stream channel
+        after startup; this keeps the adapter subscribed without a gateway
+        restart. New mid-run channels start at the membership timestamp so old
+        history is not replayed into Hermes.
+        """
+        code, out, _err = await self._run_cli(["channels", "list"])
+        if code != 0:
+            return
+        explicit = set(self.channels)
+        for ch in _parse_json_list(out):
+            ch_id = str(ch.get("channel_id") or "")
+            if not ch_id:
+                continue
+            self._channel_meta[ch_id] = ch
+            self._channel_names.setdefault(ch_id, str(ch.get("name") or ch_id))
+            if ch_id in self._channel_state:
+                continue
+            if explicit and ch_id not in explicit:
+                continue
+            if seed:
+                await self._seed_channel(ch_id, chat_type="group")
+            else:
+                self._channel_state[ch_id] = {
+                    "chat_type": "group",
+                    "last_ts": max(int(initial_last_ts or 0), 0),
+                    "seen": OrderedDict(),
+                }
 
     async def _discover_dms(self, *, seed: bool) -> None:
         """Watch DM conversations.  New ones found mid-run dispatch from their
@@ -990,7 +1119,12 @@ class BuzzAdapter(BasePlatformAdapter):
         state = self._channel_state.get(channel_id)
         if state is None:
             return
-        args = ["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)]
+        args = [
+            "messages", "get",
+            "--channel", channel_id,
+            "--limit", str(_FETCH_LIMIT),
+            "--kinds", ",".join(str(k) for k in _INBOUND_KINDS),
+        ]
         if state["last_ts"]:
             # Nostr `since` is inclusive: same-second events are re-fetched
             # and de-duped by id below.
@@ -1014,7 +1148,16 @@ class BuzzAdapter(BasePlatformAdapter):
         state["seen"][event_id] = None
         state["last_ts"] = max(state["last_ts"], created_at)
 
-        if int(event.get("kind") or 0) != _CHAT_KIND:
+        kind = int(event.get("kind") or 0)
+        if kind == _HUDDLE_STARTED_KIND:
+            await self._handle_huddle_started(channel_id, event)
+            return
+        if kind == _HUDDLE_ENDED_KIND:
+            self._handle_huddle_ended(event)
+            return
+        if kind == _HUDDLE_GUIDELINES_KIND:
+            return
+        if kind != _CHAT_KIND:
             return
         pubkey = str(event.get("pubkey") or "").lower()
         content = event.get("content")
@@ -1047,6 +1190,11 @@ class BuzzAdapter(BasePlatformAdapter):
         # open with "@Chip" even though no mention is required there, so the
         # strip applies to both chat types.
         dispatch_text = self._strip_mention(content)
+        if self._is_huddle_channel(channel_id):
+            dispatch_text = (
+                "[Buzz Huddle voice mode: keep replies brief and natural; your messages may be read aloud by Buzz TTS.]\n"
+                + dispatch_text
+            )
 
         await self._dispatch_message(
             text=dispatch_text,
@@ -1083,6 +1231,76 @@ class BuzzAdapter(BasePlatformAdapter):
     # "DM" with an empty description.  Nothing is lost while unlatched: a
     # DM message that DOES mention us dispatches through the mention gate
     # anyway, so the latch flips exactly on the first message that needs it.
+
+    async def _handle_huddle_started(self, parent_channel_id: str, event: dict) -> None:
+        """Join a Buzz Huddle backing channel when a parent channel announces it.
+
+        Huddles are announced to the parent channel as kind:48100 with a JSON
+        ``ephemeral_channel_id``. The desktop UI may not expose that backing
+        channel through ``channels list`` until the agent is explicitly added,
+        so try the same NIP-29 add-member operation the Desktop uses. If relay
+        policy rejects it, log and leave normal channel behavior untouched.
+        """
+        if not self.auto_join_huddles or not self._self_pubkey:
+            return
+        content = event.get("content")
+        try:
+            data = json.loads(content) if isinstance(content, str) else {}
+        except ValueError:
+            data = {}
+        ephemeral_id = str(data.get("ephemeral_channel_id") or "").strip()
+        if not ephemeral_id or ephemeral_id in self._channel_state:
+            return
+        code, _out, err = await self._run_cli([
+            "channels", "add-member",
+            "--channel", ephemeral_id,
+            "--pubkey", self._self_pubkey,
+            "--role", "bot",
+        ])
+        if code != 0:
+            logger.info(
+                "Buzz: Huddle %s announced in %s but auto-join was rejected — %s",
+                ephemeral_id, parent_channel_id, _cli_error_message(err, code),
+            )
+            return
+        self._channel_meta[ephemeral_id] = {
+            "channel_id": ephemeral_id,
+            "name": f"huddle-{ephemeral_id[:8]}",
+            "channel_type": "stream",
+            "parent_channel_id": parent_channel_id,
+        }
+        self._channel_names[ephemeral_id] = f"huddle-{ephemeral_id[:8]}"
+        self._channel_state[ephemeral_id] = {
+            "chat_type": "group",
+            "last_ts": max(int(event.get("created_at") or time.time()) - 1, 0),
+            "seen": OrderedDict(),
+        }
+        logger.info("Buzz: auto-joined Huddle conversation %s from parent %s", ephemeral_id, parent_channel_id)
+
+    def _handle_huddle_ended(self, event: dict) -> None:
+        content = event.get("content")
+        try:
+            data = json.loads(content) if isinstance(content, str) else {}
+        except ValueError:
+            data = {}
+        ephemeral_id = str(data.get("ephemeral_channel_id") or "").strip()
+        if ephemeral_id:
+            self._channel_state.pop(ephemeral_id, None)
+            self._channel_meta.pop(ephemeral_id, None)
+            self._channel_names.pop(ephemeral_id, None)
+
+    def _is_huddle_channel(self, channel_id: str) -> bool:
+        """Best-effort detection of Buzz Huddle backing channels.
+
+        Buzz Desktop creates huddles as private ephemeral stream channels,
+        usually named ``huddle-<shortid>``. The relay exposes them through the
+        same channel/message APIs as normal text channels; when detected, add a
+        lightweight voice-mode hint to the prompt so replies are TTS-friendly.
+        """
+        meta = self._channel_meta.get(channel_id) or {}
+        name = str(meta.get("name") or self._channel_names.get(channel_id, "")).lower()
+        channel_type = str(meta.get("channel_type") or meta.get("type") or "").lower()
+        return channel_type == "stream" or name.startswith("huddle-") or "huddle" in name
 
     def _may_reclassify_as_dm(self, channel_id: str) -> bool:
         """True when the conversation's metadata does not rule out a DM.
@@ -1302,6 +1520,9 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
     interval = extra.get("poll_interval")
     if interval is not None and not os.getenv("BUZZ_POLL_INTERVAL"):
         os.environ["BUZZ_POLL_INTERVAL"] = str(interval)
+    presence_interval = extra.get("presence_interval")
+    if presence_interval is not None and not os.getenv("BUZZ_PRESENCE_INTERVAL"):
+        os.environ["BUZZ_PRESENCE_INTERVAL"] = str(presence_interval)
     channels = extra.get("channels")
     if channels is not None and not os.getenv("BUZZ_CHANNELS"):
         if isinstance(channels, (list, tuple)):
@@ -1316,6 +1537,10 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
         os.environ["BUZZ_ALLOW_ALL_USERS"] = str(extra["allow_all_users"]).lower()
     if "require_mention" in extra and not os.getenv("BUZZ_REQUIRE_MENTION"):
         os.environ["BUZZ_REQUIRE_MENTION"] = str(extra["require_mention"]).lower()
+    if "presence_enabled" in extra and not os.getenv("BUZZ_PRESENCE_ENABLED"):
+        os.environ["BUZZ_PRESENCE_ENABLED"] = str(extra["presence_enabled"]).lower()
+    if "auto_join_huddles" in extra and not os.getenv("BUZZ_AUTO_JOIN_HUDDLES"):
+        os.environ["BUZZ_AUTO_JOIN_HUDDLES"] = str(extra["auto_join_huddles"]).lower()
     return None
 
 
@@ -1342,6 +1567,15 @@ def _env_enablement() -> Optional[dict]:
             seed["poll_interval"] = float(interval)
         except ValueError:
             pass
+    presence_interval = os.getenv("BUZZ_PRESENCE_INTERVAL", "").strip()
+    if presence_interval:
+        try:
+            seed["presence_interval"] = float(presence_interval)
+        except ValueError:
+            pass
+    presence_enabled = os.getenv("BUZZ_PRESENCE_ENABLED", "").strip()
+    if presence_enabled:
+        seed["presence_enabled"] = presence_enabled.lower() not in ("false", "0", "no", "off")
     cli_path = os.getenv("BUZZ_CLI_PATH", "").strip()
     if cli_path:
         seed["cli_path"] = cli_path

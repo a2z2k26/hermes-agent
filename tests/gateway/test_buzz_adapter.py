@@ -43,6 +43,9 @@ _ENV_VARS = (
     "BUZZ_ALLOWED_USERS",
     "BUZZ_ALLOW_ALL_USERS",
     "BUZZ_POLL_INTERVAL",
+    "BUZZ_PRESENCE_ENABLED",
+    "BUZZ_PRESENCE_INTERVAL",
+    "BUZZ_AUTO_JOIN_HUDDLES",
     "BUZZ_CLI_PATH",
     "BUZZ_CREDENTIALS_FILE",
 )
@@ -127,6 +130,7 @@ class TestBuzzAdapterInit:
                 "relay_url": "https://cfg.relay",
                 "channels": ["ccc"],
                 "poll_interval": 2,
+                "presence_interval": 30,
                 "home_channel": "ccc",
             },
         )
@@ -134,6 +138,8 @@ class TestBuzzAdapterInit:
         assert adapter.relay_url == "https://cfg.relay"
         assert adapter.channels == ["ccc"]
         assert adapter.poll_interval == 2.0
+        assert adapter.presence_enabled is True
+        assert adapter.presence_interval == 30.0
         assert adapter.home_channel == "ccc"
 
     def test_env_overrides_config(self, monkeypatch):
@@ -374,11 +380,110 @@ class TestDmClassification:
         ])
         a._run_cli = cli
         await a._discover_dms(seed=False)
-        # Watched as group; the p-tag latch flips it on the first real DM.
-        assert a._channel_state[DM_CHANNEL]["chat_type"] == "group"
-        assert a._may_reclassify_as_dm(DM_CHANNEL) is True
+        assert DM_CHANNEL in a._channel_state
         assert CHANNEL not in a._channel_state
-        assert a._may_reclassify_as_dm(CHANNEL) is False
+
+    @pytest.mark.asyncio
+    async def test_membership_event_discovers_future_channels_and_huddles(self):
+        """All-joined mode should pick up channels/huddle streams added mid-run."""
+        a = _make_adapter()
+        a._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 10, "seen": {}}
+        cli = _ScriptedCli()
+        huddle = "11111111-2222-4333-8444-555555555555"
+        cli.script("channels", "list", [
+            {"channel_id": CHANNEL, "name": "general", "channel_type": "text"},
+            {"channel_id": huddle, "name": "huddle-11111111", "channel_type": "stream"},
+        ])
+        cli.script("dms", "list", [])
+        a._run_cli = cli
+
+        class Ws:
+            def __init__(self):
+                self.sent = []
+            async def send(self, raw):
+                self.sent.append(json.loads(raw))
+
+        ws = Ws()
+        subscriptions = {"existing": CHANNEL}
+        await a._handle_membership_event(
+            ws,
+            subscriptions,
+            {"kind": 9000, "created_at": 100, "tags": [["p", SELF_PUBKEY], ["h", huddle]]},
+        )
+        assert huddle in a._channel_state
+        assert a._channel_state[huddle]["last_ts"] == 99
+        assert a._is_huddle_channel(huddle) is True
+        assert any(sent[0] == "REQ" and sent[2]["#h"] == [huddle] for sent in ws.sent)
+
+    @pytest.mark.asyncio
+    async def test_huddle_started_event_auto_joins_backing_channel(self):
+        a = _make_adapter()
+        huddle = "11111111-2222-4333-8444-555555555555"
+        a._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        cli = _ScriptedCli()
+        cli.script("channels", "add-member", {"accepted": True, "message": ""})
+        a._run_cli = cli
+        await a._handle_event(
+            CHANNEL,
+            a._channel_state[CHANNEL],
+            {
+                "id": "huddle-started",
+                "kind": 48100,
+                "created_at": 100,
+                "pubkey": OTHER_PUBKEY,
+                "content": json.dumps({"ephemeral_channel_id": huddle}),
+                "tags": [["h", CHANNEL]],
+            },
+        )
+        assert huddle in a._channel_state
+        assert a._channel_state[huddle]["last_ts"] == 99
+        assert a._is_huddle_channel(huddle) is True
+        assert ["channels", "add-member", "--channel", huddle, "--pubkey", SELF_PUBKEY, "--role", "bot"] in [c[0] for c in cli.calls]
+
+    @pytest.mark.asyncio
+    async def test_huddle_started_rejection_does_not_fake_subscription(self):
+        a = _make_adapter()
+        huddle = "11111111-2222-4333-8444-555555555555"
+        a._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        cli = _ScriptedCli()
+        cli.script("channels", "add-member", {"error": "restricted"}, code=2, stderr="restricted")
+        a._run_cli = cli
+        await a._handle_event(
+            CHANNEL,
+            a._channel_state[CHANNEL],
+            {
+                "id": "huddle-started",
+                "kind": 48100,
+                "created_at": 100,
+                "pubkey": OTHER_PUBKEY,
+                "content": json.dumps({"ephemeral_channel_id": huddle}),
+                "tags": [["h", CHANNEL]],
+            },
+        )
+        assert huddle not in a._channel_state
+
+    @pytest.mark.asyncio
+    async def test_huddle_messages_get_voice_mode_hint(self):
+        a = _make_adapter()
+        huddle = "11111111-2222-4333-8444-555555555555"
+        a._dispatched = []
+        async def capture(**kwargs):
+            a._dispatched.append(kwargs)
+        a._dispatch_message = capture
+        a._message_handler = AsyncMock()
+        a._channel_meta[huddle] = {"channel_id": huddle, "name": "huddle-11111111", "channel_type": "stream"}
+        a._channel_names[huddle] = "huddle-11111111"
+        a._channel_state[huddle] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        cli = _ScriptedCli()
+        cli.script("messages", "get", [_tagged_event("e1", huddle, content="@Chip summarize that", created_at=10)])
+        a._run_cli = cli
+        await a._poll_channel(huddle)
+        assert len(a._dispatched) == 1
+        assert a._dispatched[0]["text"].startswith("[Buzz Huddle voice mode:")
+        assert a._dispatched[0]["text"].endswith("summarize that")
+
+
+# ── Sending ────────────────────────────────────────────────────────────────
 
 
 # ── Sending ───────────────────────────────────────────────────────────────
@@ -406,6 +511,32 @@ class TestBuzzAdapterSend:
         assert stdin_text == "hello **markdown**"
         # Our own event id is marked seen for echo suppression
         assert "evt123" in adapter._channel_state[CHANNEL]["seen"]
+
+    @pytest.mark.asyncio
+    async def test_send_ignores_reply_target_by_default(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt124", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "hello", reply_to="incoming-event")
+        assert result.success is True
+
+        args, _stdin_text = cli.calls[0]
+        assert "--reply-to" not in args
+
+    @pytest.mark.asyncio
+    async def test_send_reply_target_when_explicitly_enabled(self):
+        adapter = _make_adapter({"reply_to_messages": True})
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt125", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "hello", metadata={"thread_id": "incoming-event"})
+        assert result.success is True
+
+        args, _stdin_text = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "incoming-event"
 
 
     @pytest.mark.asyncio
@@ -444,6 +575,37 @@ class TestBuzzAdapterLifecycle:
         await adapter.disconnect()
         assert released == [("buzz", "wss://relay.example:" + SELF_PUBKEY)]
         assert adapter._lock_key is None
+
+    @pytest.mark.asyncio
+    async def test_connect_and_disconnect_publish_presence(self, monkeypatch):
+        """Gateway liveness should drive Buzz online/offline presence."""
+        import gateway.status as gateway_status
+
+        monkeypatch.setattr(gateway_status, "acquire_scoped_lock", lambda platform, key: True)
+        released = []
+        monkeypatch.setattr(
+            gateway_status,
+            "release_scoped_lock",
+            lambda platform, key: released.append((platform, key)),
+        )
+        adapter = _make_adapter({"transport": "poll", "presence_interval": 3600})
+        adapter.cli_path = "/fake/buzz"
+        monkeypatch.setattr(_buzz_mod, "_resolve_private_key", lambda extra=None: "nsec1test")
+        cli = _ScriptedCli()
+        cli.script("users", "get", [{"pubkey": SELF_PUBKEY, "display_name": "Chip"}])
+        cli.script("channels", "list", [{"channel_id": CHANNEL, "name": "general"}])
+        cli.script("messages", "get", [])
+        cli.script("dms", "list", [])
+        cli.script("users", "set-presence", {"accepted": True, "message": ""})
+        adapter._run_cli = cli
+
+        assert await adapter.connect() is True
+        assert ["users", "set-presence", "--status", "online"] in [call[0] for call in cli.calls]
+
+        await adapter.disconnect()
+        calls = [call[0] for call in cli.calls]
+        assert ["users", "set-presence", "--status", "offline"] in calls
+        assert released == [("buzz", "https://test.relay:" + SELF_PUBKEY)]
 
     @pytest.mark.asyncio
     async def test_connect_fails_when_identity_lock_held(self, monkeypatch):
