@@ -720,6 +720,7 @@ class TestDiscordVoiceChannelMethods:
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
         adapter._voice_timeout_tasks = {}
+        adapter._voice_empty_channel_tasks = {}
         adapter._voice_receivers = {}
         adapter._voice_listen_tasks = {}
         adapter._voice_input_callback = None
@@ -842,13 +843,51 @@ class TestDiscordVoiceChannelMethods:
         with patch("hermes_cli.config.read_raw_config", return_value={
             "discord": {
                 "voice_channel_inactivity_timeout_seconds": 0,
+                "voice_empty_channel_timeout_seconds": 30,
                 "voice_playback_timeout_seconds": 240,
             }
         }):
             adapter = DiscordAdapter(PlatformConfig(enabled=True, token="x"))
 
         assert adapter._voice_timeout_seconds == 0
+        assert adapter._voice_empty_channel_timeout_seconds == 30
         assert adapter._playback_timeout_seconds == 240
+
+    def test_voice_empty_channel_timer_only_when_bot_is_alone(self):
+        adapter = self._make_adapter()
+        adapter._voice_empty_channel_timeout_seconds = 30
+        adapter._voice_empty_channel_timeout_handler = AsyncMock()
+
+        bot = SimpleNamespace(id=1, bot=True)
+        human = SimpleNamespace(id=2, bot=False)
+        channel = SimpleNamespace(id=123, members=[bot, human])
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.channel = channel
+        adapter._client = SimpleNamespace(user=bot)
+        adapter._voice_clients[111] = vc
+
+        adapter._reset_voice_empty_channel_timeout(111)
+        assert adapter._voice_empty_channel_tasks == {}
+
+        channel.members = [bot]
+        with patch("asyncio.ensure_future") as ensure_future:
+            ensure_future.return_value = MagicMock()
+            adapter._reset_voice_empty_channel_timeout(111)
+
+        ensure_future.assert_called_once()
+        assert 111 in adapter._voice_empty_channel_tasks
+
+    def test_blank_auto_join_text_channel_disables_guild_fallback(self):
+        adapter = self._make_adapter()
+        adapter.config.home_channel = None
+        guild = SimpleNamespace(id=111)
+        with patch.object(
+            adapter,
+            "_config_value",
+            return_value={"111": "", "*": "888"},
+        ):
+            assert adapter._discord_voice_auto_join_text_channel_id(guild) is None
 
     @pytest.mark.asyncio
     async def test_playback_timeout_scales_with_audio_duration(self):
@@ -1264,6 +1303,7 @@ class TestVoiceTimeoutCleansRunnerState:
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
         adapter._voice_timeout_tasks = {}
+        adapter._voice_empty_channel_tasks = {}
         adapter._voice_receivers = {}
         adapter._voice_listen_tasks = {}
         adapter._voice_input_callback = None
@@ -1327,6 +1367,7 @@ class TestPlaybackTimeout:
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
         adapter._voice_timeout_tasks = {}
+        adapter._voice_empty_channel_tasks = {}
         adapter._voice_receivers = {}
         adapter._voice_listen_tasks = {}
         adapter._voice_input_callback = None
