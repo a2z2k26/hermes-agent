@@ -1233,49 +1233,28 @@ class BuzzAdapter(BasePlatformAdapter):
     # anyway, so the latch flips exactly on the first message that needs it.
 
     async def _handle_huddle_started(self, parent_channel_id: str, event: dict) -> None:
-        """Join a Buzz Huddle backing channel when a parent channel announces it.
+        """Record a Buzz Huddle announcement without trying an impossible self-add.
 
-        Huddles are announced to the parent channel as kind:48100 with a JSON
-        ``ephemeral_channel_id``. The desktop UI may not expose that backing
-        channel through ``channels list`` until the agent is explicitly added,
-        so try the same NIP-29 add-member operation the Desktop uses. If relay
-        policy rejects it, log and leave normal channel behavior untouched.
+        Buzz Desktop starts Huddles by creating a private ephemeral stream
+        channel, adding requested agents from the creator/member identity, then
+        publishing kind:48100 to the parent channel. A non-member agent cannot
+        add itself to that private ephemeral channel: relay ingestion applies the
+        channel membership gate before kind:9000's self-add validator. Therefore
+        the native gateway must wait for the Desktop/user side to add Marcion to
+        the Huddle and then follow the resulting kind:9000 membership event.
         """
-        if not self.auto_join_huddles or not self._self_pubkey:
-            return
         content = event.get("content")
         try:
             data = json.loads(content) if isinstance(content, str) else {}
         except ValueError:
             data = {}
         ephemeral_id = str(data.get("ephemeral_channel_id") or "").strip()
-        if not ephemeral_id or ephemeral_id in self._channel_state:
-            return
-        code, _out, err = await self._run_cli([
-            "channels", "add-member",
-            "--channel", ephemeral_id,
-            "--pubkey", self._self_pubkey,
-            "--role", "bot",
-        ])
-        if code != 0:
+        if ephemeral_id and ephemeral_id not in self._channel_state:
             logger.info(
-                "Buzz: Huddle %s announced in %s but auto-join was rejected — %s",
-                ephemeral_id, parent_channel_id, _cli_error_message(err, code),
+                "Buzz: Huddle %s announced in %s; waiting for membership event before subscribing",
+                ephemeral_id,
+                parent_channel_id,
             )
-            return
-        self._channel_meta[ephemeral_id] = {
-            "channel_id": ephemeral_id,
-            "name": f"huddle-{ephemeral_id[:8]}",
-            "channel_type": "stream",
-            "parent_channel_id": parent_channel_id,
-        }
-        self._channel_names[ephemeral_id] = f"huddle-{ephemeral_id[:8]}"
-        self._channel_state[ephemeral_id] = {
-            "chat_type": "group",
-            "last_ts": max(int(event.get("created_at") or time.time()) - 1, 0),
-            "seen": OrderedDict(),
-        }
-        logger.info("Buzz: auto-joined Huddle conversation %s from parent %s", ephemeral_id, parent_channel_id)
 
     def _handle_huddle_ended(self, event: dict) -> None:
         content = event.get("content")

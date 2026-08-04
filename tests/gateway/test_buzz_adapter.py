@@ -416,37 +416,11 @@ class TestDmClassification:
         assert any(sent[0] == "REQ" and sent[2]["#h"] == [huddle] for sent in ws.sent)
 
     @pytest.mark.asyncio
-    async def test_huddle_started_event_auto_joins_backing_channel(self):
+    async def test_huddle_started_event_waits_for_membership_notification(self):
         a = _make_adapter()
         huddle = "11111111-2222-4333-8444-555555555555"
         a._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
         cli = _ScriptedCli()
-        cli.script("channels", "add-member", {"accepted": True, "message": ""})
-        a._run_cli = cli
-        await a._handle_event(
-            CHANNEL,
-            a._channel_state[CHANNEL],
-            {
-                "id": "huddle-started",
-                "kind": 48100,
-                "created_at": 100,
-                "pubkey": OTHER_PUBKEY,
-                "content": json.dumps({"ephemeral_channel_id": huddle}),
-                "tags": [["h", CHANNEL]],
-            },
-        )
-        assert huddle in a._channel_state
-        assert a._channel_state[huddle]["last_ts"] == 99
-        assert a._is_huddle_channel(huddle) is True
-        assert ["channels", "add-member", "--channel", huddle, "--pubkey", SELF_PUBKEY, "--role", "bot"] in [c[0] for c in cli.calls]
-
-    @pytest.mark.asyncio
-    async def test_huddle_started_rejection_does_not_fake_subscription(self):
-        a = _make_adapter()
-        huddle = "11111111-2222-4333-8444-555555555555"
-        a._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
-        cli = _ScriptedCli()
-        cli.script("channels", "add-member", {"error": "restricted"}, code=2, stderr="restricted")
         a._run_cli = cli
         await a._handle_event(
             CHANNEL,
@@ -461,6 +435,26 @@ class TestDmClassification:
             },
         )
         assert huddle not in a._channel_state
+        assert cli.calls == []
+
+    @pytest.mark.asyncio
+    async def test_huddle_membership_notification_discovers_backing_channel(self):
+        a = _make_adapter()
+        huddle = "11111111-2222-4333-8444-555555555555"
+        cli = _ScriptedCli()
+        cli.script("channels", "list", [
+            {
+                "channel_id": huddle,
+                "name": "huddle-11111111",
+                "channel_type": "stream",
+                "visibility": "private",
+            }
+        ])
+        a._run_cli = cli
+        await a._discover_joined_channels(seed=False, initial_last_ts=99)
+        assert huddle in a._channel_state
+        assert a._channel_state[huddle]["last_ts"] == 99
+        assert a._is_huddle_channel(huddle) is True
 
     @pytest.mark.asyncio
     async def test_huddle_messages_get_voice_mode_hint(self):
