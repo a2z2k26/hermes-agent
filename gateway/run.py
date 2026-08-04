@@ -11003,6 +11003,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # transcription is forwarded without requiring /voice join.
                     if hasattr(adapter, "_voice_input_callback"):
                         adapter._voice_input_callback = self._handle_voice_channel_input
+                    if hasattr(adapter, "_on_voice_disconnect"):
+                        setattr(adapter, "_on_voice_disconnect", self._handle_voice_timeout_cleanup)
+                    if hasattr(adapter, "_voice_mode_getter"):
+                        setattr(
+                            adapter,
+                            "_voice_mode_getter",
+                            lambda chat_id: self._voice_mode.get(
+                                self._voice_key(Platform.DISCORD, str(chat_id)), "off"
+                            ),
+                        )
                     connected_count += 1
                     self._update_platform_runtime_status(
                         platform.value,
@@ -12366,6 +12376,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # Wire voice input callback on reconnect as well (#60623).
                         if hasattr(adapter, "_voice_input_callback"):
                             adapter._voice_input_callback = self._handle_voice_channel_input
+                        if hasattr(adapter, "_on_voice_disconnect"):
+                            setattr(adapter, "_on_voice_disconnect", self._handle_voice_timeout_cleanup)
+                        if hasattr(adapter, "_voice_mode_getter"):
+                            setattr(
+                                adapter,
+                                "_voice_mode_getter",
+                                lambda chat_id: self._voice_mode.get(
+                                    self._voice_key(Platform.DISCORD, str(chat_id)), "off"
+                                ),
+                            )
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
                         self._update_platform_runtime_status(
@@ -18803,14 +18823,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return "Left voice channel."
 
     def _handle_voice_timeout_cleanup(self, chat_id: str) -> None:
-        """Called by the adapter when a voice channel times out.
+        """Called by the adapter when an auto-joined voice channel times out.
 
-        Cleans up runner-side voice_mode state that the adapter cannot reach.
+        A timeout means "leave the currently empty voice channel", not "turn
+        voice mode off forever". Preserve the chat's persisted voice mode so the
+        next approved auto-join in any configured voice channel (for example
+        muse-voice or bredren-voice) keeps the same listen-and-speak behavior.
+        Explicit `/voice leave` still disables voice mode for the chat.
         """
-        self._voice_mode[self._voice_key(Platform.DISCORD, chat_id)] = "off"
-        self._save_voice_modes()
+        key = self._voice_key(Platform.DISCORD, chat_id)
+        if self._voice_mode.get(key) != "all":
+            self._voice_mode[key] = "all"
+            self._save_voice_modes()
         adapter = self.adapters.get(Platform.DISCORD)
-        self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
+        self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True)
 
     def _is_duplicate_voice_transcript(self, guild_id: int, user_id: int, transcript: str) -> bool:
         """Suppress repeated STT outputs for the same recent utterance.
@@ -18872,11 +18898,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Build source — reuse the linked text channel's metadata when available
         # so voice input shares the same session as the bound text conversation.
         source_data = getattr(adapter, "_voice_sources", {}).get(guild_id)
-        if source_data:
+        if source_data and "platform" in source_data and "chat_id" in source_data:
             source = SessionSource.from_dict(source_data)
             source.user_id = str(user_id)
             source.user_name = str(user_id)
         else:
+            if source_data:
+                logger.debug(
+                    "Ignoring incomplete Discord voice source metadata for guild=%s: keys=%s",
+                    guild_id,
+                    sorted(source_data.keys()) if isinstance(source_data, dict) else type(source_data).__name__,
+                )
             source = SessionSource(
                 platform=Platform.DISCORD,
                 chat_id=str(text_ch_id),

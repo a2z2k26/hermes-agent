@@ -1228,6 +1228,7 @@ class DiscordAdapter(BasePlatformAdapter):
             # so fall back to known Homebrew paths if needed.
             if not opus_path:
                 _homebrew_paths = (
+                    os.path.expanduser("~/.local/lib/libopus.dylib"),  # user-local build/install
                     "/opt/homebrew/lib/libopus.dylib",  # Apple Silicon
                     "/usr/local/lib/libopus.dylib",     # Intel Mac
                 )
@@ -1348,13 +1349,7 @@ class DiscordAdapter(BasePlatformAdapter):
             @self._client.event
             async def on_voice_state_update(member, before, after):
                 """Track voice channel join/leave events."""
-                # Only track channels where the bot is connected
-                bot_guild_ids = set(adapter_self._voice_clients.keys())
-                if not bot_guild_ids:
-                    return
                 guild_id = member.guild.id
-                if guild_id not in bot_guild_ids:
-                    return
                 # Ignore the bot itself
                 if member == adapter_self._client.user:
                     return
@@ -1377,6 +1372,31 @@ class DiscordAdapter(BasePlatformAdapter):
                         else f"moved {before.channel.name} -> {after.channel.name}",
                         guild_id,
                     )
+
+                await adapter_self._maybe_auto_join_voice(member, before, after)
+
+                # Only continue with connected-channel tracking when the bot is
+                # connected in this guild.
+                bot_guild_ids = set(adapter_self._voice_clients.keys())
+                if guild_id not in bot_guild_ids:
+                    return
+
+                # Human voice-state changes are the true leave/keepalive signal
+                # for personal voice sessions.  Do not use a blind inactivity
+                # countdown that can eject the bot while the approved human is
+                # still present; reset/schedule based on current channel members.
+                # On leave/move-away, discord.py can report stale
+                # ``channel.members`` during this callback, so force a timer when
+                # the departing user was in the bot's connected channel; the
+                # timeout handler re-checks membership before disconnecting.
+                vc = adapter_self._voice_clients.get(guild_id)
+                connected_channel = getattr(vc, "channel", None) if vc and vc.is_connected() else None
+                before_channel = getattr(before, "channel", None)
+                after_channel = getattr(after, "channel", None)
+                if connected_channel is not None and before_channel == connected_channel and after_channel != connected_channel:
+                    adapter_self._schedule_voice_timeout(guild_id)
+                else:
+                    adapter_self._reset_voice_timeout(guild_id)
 
             # Register slash commands
             if self._slash_commands:
@@ -3940,6 +3960,103 @@ class DiscordAdapter(BasePlatformAdapter):
             minimum=0,
         )
 
+    def _load_discord_config_block(self) -> Dict[str, Any]:
+        """Return the top-level discord config block, or an empty dict."""
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            block = cfg.get("discord") or {}
+            return block if isinstance(block, dict) else {}
+        except Exception as e:
+            logger.debug("Could not load discord config block: %s", e)
+            return {}
+
+    async def _maybe_auto_join_voice(self, member, before, after) -> None:
+        """Auto-join an approved user's voice channel when configured.
+
+        Config shape:
+
+        discord:
+          voice_auto_join: true
+          voice_auto_join_users: ['<discord-user-id>']
+          voice_auto_join_text_channel_id:
+            '<guild-id>': '<text-channel-id>'
+
+        Optional hardening supported by this adapter:
+
+          voice_auto_join_voice_channel_id:
+            '<guild-id>': '<voice-channel-id>'
+
+        or, for several approved voice channels in one guild:
+
+          voice_auto_join_voice_channel_ids:
+            '<guild-id>': ['<voice-channel-id>', '<voice-channel-id>']
+        """
+        # Join/move events have an after.channel; pure leaves do not trigger an
+        # auto-join.  Inactivity/leave handling remains the normal voice timer.
+        target_channel = getattr(after, "channel", None)
+        if target_channel is None:
+            return
+
+        cfg = self._load_discord_config_block()
+        if not bool(cfg.get("voice_auto_join", False)):
+            return
+
+        user_ids = {str(u) for u in (cfg.get("voice_auto_join_users") or []) if str(u).strip()}
+        if str(getattr(member, "id", "")) not in user_ids:
+            return
+
+        guild_id = str(getattr(getattr(member, "guild", None), "id", ""))
+        text_map = cfg.get("voice_auto_join_text_channel_id") or {}
+        if not isinstance(text_map, dict):
+            text_map = {}
+        text_channel_id = text_map.get(guild_id)
+        if not text_channel_id:
+            logger.warning("Voice auto-join skipped for guild %s: no routing text channel configured", guild_id)
+            return
+
+        voice_maps = []
+        plural_voice_map = cfg.get("voice_auto_join_voice_channel_ids") or {}
+        if isinstance(plural_voice_map, dict):
+            raw_expected = plural_voice_map.get(guild_id) or []
+            if isinstance(raw_expected, (str, int)):
+                voice_maps.append(str(raw_expected))
+            elif isinstance(raw_expected, (list, tuple, set)):
+                voice_maps.extend(str(v) for v in raw_expected if str(v).strip())
+
+        voice_map = cfg.get("voice_auto_join_voice_channel_id") or {}
+        if isinstance(voice_map, dict):
+            expected_voice_id = str(voice_map.get(guild_id) or "")
+            if expected_voice_id:
+                voice_maps.append(expected_voice_id)
+
+        expected_voice_ids = {v for v in voice_maps if v}
+        if expected_voice_ids and str(getattr(target_channel, "id", "")) not in expected_voice_ids:
+            logger.info(
+                "Voice auto-join ignored %s in %s; configured voice channels are %s",
+                getattr(member, "display_name", member),
+                getattr(target_channel, "name", target_channel),
+                ",".join(sorted(expected_voice_ids)),
+            )
+            return
+
+        try:
+            ok = await self.join_voice_channel(
+                target_channel,
+                text_channel_id=int(text_channel_id),
+                source={"kind": "auto_join", "user_id": str(getattr(member, "id", ""))},
+            )
+            if ok:
+                logger.info(
+                    "Voice auto-joined %s (guild %s) for approved user %s; linked text channel %s",
+                    getattr(target_channel, "name", target_channel),
+                    guild_id,
+                    getattr(member, "id", ""),
+                    text_channel_id,
+                )
+        except Exception as e:
+            logger.warning("Voice auto-join failed for guild %s: %s", guild_id, e, exc_info=True)
+
     def _load_playback_timeout(self) -> int:
         """Return minimum playback wait seconds for Discord VC audio."""
         return self._load_discord_int_config(
@@ -4342,19 +4459,57 @@ class DiscordAdapter(BasePlatformAdapter):
         if task:
             task.cancel()
 
-    def _reset_voice_timeout(self, guild_id: int) -> None:
-        """Reset the auto-disconnect inactivity timer."""
+    def _schedule_voice_timeout(self, guild_id: int) -> None:
+        """Schedule the empty-channel disconnect timer unconditionally.
+
+        Used immediately after a human leaves/moves away from the connected
+        channel because discord.py may still show that user in
+        ``channel.members`` during the voice-state callback. The timeout handler
+        performs the authoritative membership re-check before leaving.
+        """
         self._cancel_voice_timeout(guild_id)
         timeout = self._voice_timeout_limit()
         if timeout <= 0:
-            logger.debug("Voice inactivity timeout disabled (guild=%d)", guild_id)
+            logger.debug("Voice empty-channel timeout disabled (guild=%d)", guild_id)
             return
         self._voice_timeout_tasks[guild_id] = asyncio.ensure_future(
             self._voice_timeout_handler(guild_id, timeout)
         )
 
+    def _reset_voice_timeout(self, guild_id: int) -> None:
+        """Reset the empty-channel disconnect timer.
+
+        The user contract for Discord personal voice is: stay while any
+        non-bot human is in the connected channel; leave only after the channel
+        has been empty of humans for the configured grace period.  Earlier
+        behavior treated this as generic inactivity and could leave while the
+        human was silently present.
+        """
+        self._cancel_voice_timeout(guild_id)
+        timeout = self._voice_timeout_limit()
+        if timeout <= 0:
+            logger.debug("Voice inactivity timeout disabled (guild=%d)", guild_id)
+            return
+
+        vc = self._voice_clients.get(guild_id)
+        channel = getattr(vc, "channel", None) if vc and vc.is_connected() else None
+        if channel is not None:
+            members = getattr(channel, "members", []) or []
+            non_bot_humans = [m for m in members if not getattr(m, "bot", False)]
+            if non_bot_humans:
+                logger.debug(
+                    "Voice empty-channel timeout not scheduled; %d human(s) present (guild=%d)",
+                    len(non_bot_humans),
+                    guild_id,
+                )
+                return
+
+        self._voice_timeout_tasks[guild_id] = asyncio.ensure_future(
+            self._voice_timeout_handler(guild_id, timeout)
+        )
+
     async def _voice_timeout_handler(self, guild_id: int, timeout: Optional[int] = None) -> None:
-        """Auto-disconnect after the configured inactivity timeout."""
+        """Auto-disconnect after the configured empty-channel grace period."""
         timeout = self._voice_timeout_limit() if timeout is None else int(timeout)
         if timeout <= 0:
             return
@@ -4362,21 +4517,18 @@ class DiscordAdapter(BasePlatformAdapter):
             await asyncio.sleep(timeout)
         except asyncio.CancelledError:
             return
+
+        # Re-check at expiry so a rejoin during the grace window cancels the
+        # leave even if the original scheduled task was not observed/cancelled.
+        vc = self._voice_clients.get(guild_id)
+        channel = getattr(vc, "channel", None) if vc and vc.is_connected() else None
+        if channel is not None:
+            members = getattr(channel, "members", []) or []
+            if any(not getattr(m, "bot", False) for m in members):
+                logger.info("Voice empty-channel leave cancelled; human rejoined (guild=%d)", guild_id)
+                return
+
         text_ch_id = self._voice_text_channels.get(guild_id)
-        # ``/voice off`` mutes spoken replies but deliberately keeps the bot in
-        # the channel (leaving is ``/voice leave``). The inactivity timer only
-        # counts the bot's OWN audio as activity, so under voice-off mode it
-        # fires every VOICE_TIMEOUT seconds, yanks the bot out, and spams the
-        # text channel with "Left voice channel (inactivity timeout)." Honor the
-        # user's choice: skip the auto-disconnect while voice replies are off.
-        # (The timer re-arms when the bot next speaks or hears a user.)
-        _mode_getter = getattr(self, "_voice_mode_getter", None)
-        if text_ch_id is not None and _mode_getter is not None:
-            try:
-                if _mode_getter(str(text_ch_id)) == "off":
-                    return
-            except Exception:
-                pass
         await self.leave_voice_channel(guild_id)
         # Notify the runner so it can clean up voice_mode state
         if self._on_voice_disconnect and text_ch_id:
