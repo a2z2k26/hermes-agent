@@ -18980,6 +18980,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt = resolved if isinstance(resolved, str) else None
             except Exception:
                 channel_prompt = None
+        try:
+            info_getter = getattr(adapter, "get_voice_channel_info", None)
+            info = info_getter(guild_id) if callable(info_getter) else None
+        except Exception:
+            info = None
+        if isinstance(info, dict) and str(info.get("channel_name", "")).strip().lower() == "bredren-voice":
+            bredren_prompt = (
+                "Bredren voice council mode is active. Marcion must not treat "
+                "this shared room like a one-on-one voice channel. Speak only "
+                "when the human directly addresses Marcion, explicitly invites "
+                "the group/council to answer, or assigns Marcion the floor. If "
+                "another agent is addressed by name, remain silent. Keep spoken "
+                "turns brief by default (1-3 sentences), avoid agent-to-agent "
+                "self-trigger loops, and do not play a join greeting in "
+                "bredren-voice."
+            )
+            channel_prompt = (
+                (channel_prompt + "\n\n" + bredren_prompt).strip()
+                if channel_prompt
+                else bredren_prompt
+            )
         event = MessageEvent(
             source=source,
             text=transcript,

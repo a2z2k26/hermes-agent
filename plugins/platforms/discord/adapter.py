@@ -4334,6 +4334,99 @@ class DiscordAdapter(BasePlatformAdapter):
             return channel_id.lower() in allowed_ids or channel_name in allowed_names
         return True
 
+    def _discord_voice_join_greeting_config(self) -> Dict[str, Any]:
+        """Return config for optional namesake-channel voice join greeting.
+
+        Config lives under ``discord.voice_join_greeting`` so the feature is
+        behavioral/user-facing configuration, not an environment secret.
+        """
+        raw = self._config_value("voice_join_greeting", None)
+        if not isinstance(raw, dict):
+            raw = {}
+        return raw
+
+    def _discord_voice_join_greeting_enabled(self) -> bool:
+        cfg = self._discord_voice_join_greeting_config()
+        value = cfg.get("enabled", False)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"true", "1", "yes", "on"}
+
+    def _discord_voice_join_greeting_channels(self) -> tuple[set[str], set[str]]:
+        cfg = self._discord_voice_join_greeting_config()
+
+        def _as_set(value: Any) -> set[str]:
+            if value is None:
+                return set()
+            if isinstance(value, dict):
+                items: list[Any] = []
+                for maybe_items in value.values():
+                    if isinstance(maybe_items, (list, tuple, set)):
+                        items.extend(maybe_items)
+                    elif maybe_items:
+                        items.extend(str(maybe_items).split(","))
+                return {str(item).strip().lower() for item in items if str(item).strip()}
+            if isinstance(value, (list, tuple, set)):
+                return {str(item).strip().lower() for item in value if str(item).strip()}
+            return {part.strip().lower() for part in str(value).split(",") if part.strip()}
+
+        return _as_set(cfg.get("channel_ids")), _as_set(cfg.get("channel_names"))
+
+    def _discord_voice_join_greeting_message(self) -> str:
+        cfg = self._discord_voice_join_greeting_config()
+        message = str(cfg.get("message") or "Hello, Marcion here. How can I help?").strip()
+        return message[:300] or "Hello, Marcion here. How can I help?"
+
+    def _discord_voice_should_greet_on_join(self, channel) -> bool:
+        """True only for configured namesake voice channels.
+
+        Shared rooms such as bredren-voice should remain silent on join; only
+        the explicitly configured namesake channel(s) trigger the greeting.
+        """
+        if not self._discord_voice_join_greeting_enabled():
+            return False
+        channel_ids, channel_names = self._discord_voice_join_greeting_channels()
+        if not channel_ids and not channel_names:
+            return False
+        channel_id = str(getattr(channel, "id", "") or "").strip().lower()
+        channel_name = str(getattr(channel, "name", "") or "").strip().lower()
+        return channel_id in channel_ids or channel_name in channel_names
+
+    async def _maybe_play_voice_join_greeting(self, guild_id: int, channel) -> None:
+        """Best-effort spoken greeting for configured namesake channels."""
+        if not self._discord_voice_should_greet_on_join(channel):
+            return
+        import uuid as _uuid
+
+        audio_path = os.path.join(
+            tempfile.gettempdir(),
+            "hermes_voice",
+            f"join_greeting_{_uuid.uuid4().hex[:12]}.mp3",
+        )
+        os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+        actual = audio_path
+        try:
+            from tools.tts_tool import text_to_speech_tool
+
+            result_json = await asyncio.to_thread(
+                text_to_speech_tool,
+                text=self._discord_voice_join_greeting_message(),
+                output_path=audio_path,
+            )
+            result = json.loads(result_json)
+            actual = result.get("file_path") or audio_path
+            if not result.get("success") or not os.path.isfile(actual):
+                logger.debug("Voice join greeting TTS failed: %s", result)
+                return
+            await self.play_in_voice_channel(guild_id, actual)
+        except Exception as e:
+            logger.debug("Voice join greeting failed: %s", e, exc_info=True)
+        finally:
+            for p in {audio_path, actual}:
+                if p and os.path.isfile(p):
+                    with suppress(OSError):
+                        os.unlink(p)
+
     def _mark_voice_chat_enabled(self, chat_id: str) -> None:
         """Mirror /voice channel state after an automatic voice join."""
         runner = getattr(self, "gateway_runner", None)
@@ -4378,6 +4471,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     return True
                 await existing.move_to(channel)
                 self._reset_voice_timeout(guild_id)
+                await self._maybe_play_voice_join_greeting(guild_id, channel)
                 return True
 
             vc = await channel.connect()
@@ -4410,6 +4504,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     await self._install_voice_mixer(guild_id, vc)
                 except Exception as e:
                     logger.warning("Voice mixer failed to start: %s", e)
+
+            await self._maybe_play_voice_join_greeting(guild_id, channel)
 
             return True
 

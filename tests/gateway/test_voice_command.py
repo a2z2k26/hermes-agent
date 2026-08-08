@@ -889,6 +889,29 @@ class TestDiscordVoiceChannelMethods:
         ):
             assert adapter._discord_voice_auto_join_text_channel_id(guild) is None
 
+    def test_voice_join_greeting_only_matches_configured_namesake_channel(self):
+        adapter = self._make_adapter()
+        adapter._config_value = MagicMock(return_value={
+            "enabled": True,
+            "message": "Hello, Marcion here. How can I help?",
+            "channel_names": "marcion-voice",
+            "channel_ids": "1534095208684453969",
+        })
+
+        marcion_channel = SimpleNamespace(id=1534095208684453969, name="marcion-voice")
+        bredren_channel = SimpleNamespace(id=1476645830898483346, name="bredren-voice")
+
+        assert adapter._discord_voice_should_greet_on_join(marcion_channel) is True
+        assert adapter._discord_voice_should_greet_on_join(bredren_channel) is False
+
+    def test_voice_join_greeting_disabled_by_default(self):
+        adapter = self._make_adapter()
+        adapter._config_value = MagicMock(return_value=None)
+
+        channel = SimpleNamespace(id=1534095208684453969, name="marcion-voice")
+
+        assert adapter._discord_voice_should_greet_on_join(channel) is False
+
     @pytest.mark.asyncio
     async def test_playback_timeout_scales_with_audio_duration(self):
         adapter = self._make_adapter()
