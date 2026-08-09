@@ -323,18 +323,33 @@ class TestYamlBridgeSeeding:
         from agent import secret_scope
         from plugins.platforms.discord.adapter import _apply_yaml_config
 
+        greeting = {
+            "enabled": True,
+            "message": "Hello, Marcion here. How can I help?",
+            "channel_names": "marcion-voice",
+            "channel_ids": "1534095208684453969",
+        }
         monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
         token = secret_scope.set_secret_scope({"SOME": "scope"})
         try:
             seeded = _apply_yaml_config(
-                {}, {"allowed_channels": "222", "allow_from": "2001"},
+                {},
+                {
+                    "allowed_channels": "222",
+                    "allow_from": "2001",
+                    "voice_join_greeting": greeting,
+                    "voice_empty_channel_timeout_seconds": 30,
+                },
             )
         finally:
             secret_scope.reset_secret_scope(token)
 
-        # Gates still seeded per-adapter...
+        assert seeded is not None
+        # Gates and voice behavior config still seed per-adapter...
         assert seeded["allowed_channels"] == "222"
         assert seeded["allow_from"] == "2001"
+        assert seeded["voice_join_greeting"] == greeting
+        assert seeded["voice_empty_channel_timeout_seconds"] == 30
         # ...but process-global env stays clean: no cross-profile leak.
         assert os.getenv("DISCORD_ALLOWED_CHANNELS") is None
         assert os.getenv("DISCORD_ALLOWED_USERS") is None

@@ -10484,16 +10484,18 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         ("voice_auto_join", "DISCORD_VOICE_AUTO_JOIN"),
         ("voice_auto_join_users", "DISCORD_VOICE_AUTO_JOIN_USERS"),
         ("voice_auto_join_text_channel_id", "DISCORD_VOICE_AUTO_JOIN_TEXT_CHANNEL_ID"),
+        ("voice_empty_channel_timeout_seconds", None),
         ("voice_allowed_channel_ids", "DISCORD_VOICE_ALLOWED_CHANNEL_IDS"),
         ("voice_allowed_channel_names", "DISCORD_VOICE_ALLOWED_CHANNEL_NAMES"),
         ("voice_denied_channel_ids", "DISCORD_VOICE_DENIED_CHANNEL_IDS"),
         ("voice_denied_channel_names", "DISCORD_VOICE_DENIED_CHANNEL_NAMES"),
+        ("voice_join_greeting", None),
     )
     for key, env_key in _voice_auto_join_keys:
         value = _websocket_liveness_cfg.get(key)
         if value is not None:
             seeded_extra[key] = value
-            if not _skip_env_bridge and not os.getenv(env_key):
+            if env_key and not _skip_env_bridge and not os.getenv(env_key):
                 if isinstance(value, (list, tuple, set)):
                     value = ",".join(str(v) for v in value)
                 os.environ[env_key] = str(value)
