@@ -4377,6 +4377,12 @@ class DiscordAdapter(BasePlatformAdapter):
         message = str(cfg.get("message") or "Hello, Marcion here. How can I help?").strip()
         return message[:300] or "Hello, Marcion here. How can I help?"
 
+    def _discord_voice_join_greeting_audio_path(self) -> Optional[str]:
+        """Optional pre-rendered greeting audio for instant voice joins."""
+        cfg = self._discord_voice_join_greeting_config()
+        audio_path = str(cfg.get("audio_path") or "").strip()
+        return audio_path or None
+
     def _discord_voice_should_greet_on_join(self, channel) -> bool:
         """True only for configured namesake voice channels.
 
@@ -4398,6 +4404,20 @@ class DiscordAdapter(BasePlatformAdapter):
             return
         import uuid as _uuid
 
+        configured_audio = self._discord_voice_join_greeting_audio_path()
+        if configured_audio:
+            if os.path.isfile(configured_audio):
+                logger.info(
+                    "Voice join greeting playing cached audio in %s (%s)",
+                    getattr(channel, "name", getattr(channel, "id", "?")),
+                    getattr(channel, "id", "?"),
+                )
+                success = await self.play_in_voice_channel(guild_id, configured_audio)
+                if not success:
+                    logger.warning("Voice join greeting cached playback returned false: %s", configured_audio)
+                return
+            logger.warning("Voice join greeting cached audio missing: %s", configured_audio)
+
         audio_path = os.path.join(
             tempfile.gettempdir(),
             "hermes_voice",
@@ -4416,11 +4436,16 @@ class DiscordAdapter(BasePlatformAdapter):
             result = json.loads(result_json)
             actual = result.get("file_path") or audio_path
             if not result.get("success") or not os.path.isfile(actual):
-                logger.debug("Voice join greeting TTS failed: %s", result)
+                logger.warning("Voice join greeting TTS failed: %s", result)
                 return
+            logger.info(
+                "Voice join greeting playing generated audio in %s (%s)",
+                getattr(channel, "name", getattr(channel, "id", "?")),
+                getattr(channel, "id", "?"),
+            )
             await self.play_in_voice_channel(guild_id, actual)
         except Exception as e:
-            logger.debug("Voice join greeting failed: %s", e, exc_info=True)
+            logger.warning("Voice join greeting failed: %s", e, exc_info=True)
         finally:
             for p in {audio_path, actual}:
                 if p and os.path.isfile(p):

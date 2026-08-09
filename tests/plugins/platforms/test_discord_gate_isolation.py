@@ -328,6 +328,7 @@ class TestYamlBridgeSeeding:
             "message": "Hello, Marcion here. How can I help?",
             "channel_names": "marcion-voice",
             "channel_ids": "1534095208684453969",
+            "audio_path": "/Users/marcion/.hermes/audio_cache/marcion_join_greeting.mp3",
         }
         monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
         token = secret_scope.set_secret_scope({"SOME": "scope"})

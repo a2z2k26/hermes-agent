@@ -896,6 +896,7 @@ class TestDiscordVoiceChannelMethods:
             "message": "Hello, Marcion here. How can I help?",
             "channel_names": "marcion-voice",
             "channel_ids": "1534095208684453969",
+            "audio_path": "/tmp/marcion_join_greeting.mp3",
         })
 
         marcion_channel = SimpleNamespace(id=1534095208684453969, name="marcion-voice")
@@ -903,6 +904,7 @@ class TestDiscordVoiceChannelMethods:
 
         assert adapter._discord_voice_should_greet_on_join(marcion_channel) is True
         assert adapter._discord_voice_should_greet_on_join(bredren_channel) is False
+        assert adapter._discord_voice_join_greeting_audio_path() == "/tmp/marcion_join_greeting.mp3"
 
     def test_voice_join_greeting_disabled_by_default(self):
         adapter = self._make_adapter()
