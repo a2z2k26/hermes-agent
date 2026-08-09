@@ -86,6 +86,172 @@ def _make_runner(tmp_path):
 
 
 # =====================================================================
+# Discord voice-channel adapter join/move behavior
+# =====================================================================
+
+class TestDiscordVoiceJoinMove:
+    def _make_adapter(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+        from gateway.config import Platform, PlatformConfig
+        config = PlatformConfig(enabled=True, extra={})
+        adapter = object.__new__(DiscordAdapter)
+        adapter.platform = Platform.DISCORD
+        adapter.config = config
+        adapter._client = MagicMock()
+        adapter._voice_clients = {}
+        adapter._voice_locks = {}
+        adapter._voice_text_channels = {}
+        adapter._voice_sources = {}
+        adapter._voice_timeout_tasks = {}
+        adapter._voice_receivers = {}
+        adapter._voice_listen_tasks = {}
+        adapter._voice_mixers = {}
+        adapter._voice_fx_cfg = {"enabled": False}
+        adapter._allowed_user_ids = {"1003486059386130463"}
+        adapter._reset_voice_timeout = MagicMock()
+        adapter._voice_listen_loop = MagicMock()
+        return adapter
+
+    def _channel(self, guild_id=111, channel_id=222):
+        return SimpleNamespace(
+            id=channel_id,
+            guild=SimpleNamespace(id=guild_id),
+            connect=AsyncMock(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_move_between_allowed_voice_channels_restarts_receiver_and_refreshes_binding(self):
+        adapter = self._make_adapter()
+        old_channel = self._channel(channel_id=222)
+        new_channel = self._channel(channel_id=333)
+        existing_vc = MagicMock()
+        existing_vc.is_connected.return_value = True
+        existing_vc.channel = old_channel
+        existing_vc.move_to = AsyncMock(side_effect=lambda ch: setattr(existing_vc, "channel", ch))
+        adapter._voice_clients[111] = existing_vc
+        old_receiver = MagicMock()
+        adapter._voice_receivers[111] = old_receiver
+        old_task = MagicMock()
+        adapter._voice_listen_tasks[111] = old_task
+
+        new_receiver = MagicMock()
+        with patch("plugins.platforms.discord.adapter.VoiceReceiver", return_value=new_receiver):
+            ok = await adapter.join_voice_channel(
+                new_channel,
+                text_channel_id=444,
+                source={"kind": "auto_join", "user_id": "1003486059386130463"},
+            )
+
+        assert ok is True
+        existing_vc.move_to.assert_awaited_once_with(new_channel)
+        old_receiver.stop.assert_called_once()
+        old_task.cancel.assert_called_once()
+        new_receiver.start.assert_called_once()
+        assert adapter._voice_receivers[111] is new_receiver
+        assert adapter._voice_text_channels[111] == 444
+        assert adapter._voice_sources[111]["kind"] == "auto_join"
+
+    @pytest.mark.asyncio
+    async def test_same_channel_auto_join_refresh_starts_missing_receiver(self):
+        adapter = self._make_adapter()
+        channel = self._channel(channel_id=222)
+        existing_vc = MagicMock()
+        existing_vc.is_connected.return_value = True
+        existing_vc.channel = channel
+        adapter._voice_clients[111] = existing_vc
+
+        receiver = MagicMock()
+        with patch("plugins.platforms.discord.adapter.VoiceReceiver", return_value=receiver):
+            ok = await adapter.join_voice_channel(
+                channel,
+                text_channel_id=555,
+                source={"kind": "auto_join", "user_id": "1003486059386130463"},
+            )
+
+        assert ok is True
+        receiver.start.assert_called_once()
+        assert adapter._voice_receivers[111] is receiver
+        assert adapter._voice_text_channels[111] == 555
+
+
+    def test_namesake_greeting_only_for_muse_voice_not_bredren(self):
+        adapter = self._make_adapter()
+        adapter._load_discord_config_block = MagicMock(return_value={
+            "voice_join_greeting": {
+                "enabled": True,
+                "agent_name": "Muse",
+                "message": "Hello, Muse here. How can I help?",
+                "channel_names": '["muse-voice"]',
+                "channel_ids": '["1534095458559856721"]',
+            }
+        })
+        muse_channel = SimpleNamespace(id=1534095458559856721, name="muse-voice")
+        bredren_channel = SimpleNamespace(id=1476645830898483346, name="bredren-voice")
+
+        assert adapter._voice_join_greeting_for_channel(muse_channel) == "Hello, Muse here. How can I help?"
+        assert adapter._voice_join_greeting_for_channel(bredren_channel) is None
+
+
+class TestDiscordBredrenCouncilMode:
+    def _runner_and_adapter(self, channel_name="bredren-voice", channel_id=1476645830898483346):
+        from gateway.run import GatewayRunner
+        from gateway.config import Platform
+        runner = object.__new__(GatewayRunner)
+        channel = SimpleNamespace(id=channel_id, name=channel_name)
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.channel = channel
+        adapter = SimpleNamespace(_voice_clients={111: vc})
+        runner.adapters = {Platform.DISCORD: adapter}  # type: ignore[assignment]
+        return runner, adapter
+
+    def _patch_config(self, monkeypatch):
+        cfg = {
+            "discord": {
+                "voice_council_mode": {
+                    "enabled": True,
+                    "agent_name": "Muse",
+                    "channel_names": '["bredren-voice"]',
+                    "channel_ids": '["1476645830898483346"]',
+                    "direct_address_names": '["muse"]',
+                    "other_agent_names": '["marcion","achilles","bumba"]',
+                    "group_invite_terms": '["everyone","round robin","weigh in"]',
+                }
+            }
+        }
+        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: cfg)
+
+    def test_allows_direct_muse_address(self, monkeypatch):
+        self._patch_config(monkeypatch)
+        runner, adapter = self._runner_and_adapter()
+        allowed, prompt = runner._discord_council_mode_decision(
+            adapter, 111, "Muse, answer briefly."
+        )
+        assert allowed is True
+        assert prompt is not None
+        assert "council mode" in prompt
+
+    def test_suppresses_other_agent_address(self, monkeypatch):
+        self._patch_config(monkeypatch)
+        runner, adapter = self._runner_and_adapter()
+        allowed, prompt = runner._discord_council_mode_decision(
+            adapter, 111, "Achilles, say one sentence."
+        )
+        assert allowed is False
+        assert prompt is None
+
+    def test_allows_explicit_group_round(self, monkeypatch):
+        self._patch_config(monkeypatch)
+        runner, adapter = self._runner_and_adapter()
+        allowed, prompt = runner._discord_council_mode_decision(
+            adapter, 111, "I want to hear from everyone in round robin order."
+        )
+        assert allowed is True
+        assert prompt is not None
+        assert "Marcion, Muse, Achilles, Bumba" in prompt
+
+
+# =====================================================================
 # /voice command handler
 # =====================================================================
 

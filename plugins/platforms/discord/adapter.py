@@ -3971,6 +3971,95 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("Could not load discord config block: %s", e)
             return {}
 
+    def _voice_join_greeting_for_channel(self, channel) -> Optional[str]:
+        """Return a configured one-shot join greeting for this voice channel.
+
+        This is intentionally channel-gated: namesake rooms may get a short
+        hello, but shared rooms such as bredren-voice stay silent on join.
+        """
+        cfg = self._load_discord_config_block()
+        greeting = cfg.get("voice_join_greeting") or {}
+        if not isinstance(greeting, dict) or not bool(greeting.get("enabled", False)):
+            return None
+
+        def _as_list(value: Any) -> list[Any]:
+            if value is None:
+                return []
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return []
+                if text.startswith("["):
+                    try:
+                        parsed = json.loads(text)
+                        if isinstance(parsed, list):
+                            return parsed
+                    except Exception:
+                        pass
+                return [text]
+            if isinstance(value, (list, tuple, set)):
+                return list(value)
+            return [value]
+
+        channel_id = str(getattr(channel, "id", "") or "")
+        channel_name = str(getattr(channel, "name", "") or "").strip().lower()
+        allowed_ids = {str(v) for v in _as_list(greeting.get("channel_ids")) if str(v).strip()}
+        allowed_names = {
+            str(v).strip().lower()
+            for v in _as_list(greeting.get("channel_names"))
+            if str(v).strip()
+        }
+        if allowed_ids and channel_id not in allowed_ids:
+            return None
+        if allowed_names and channel_name not in allowed_names:
+            return None
+        if not allowed_ids and not allowed_names:
+            return None
+
+        agent_name = str(greeting.get("agent_name") or "Muse").strip() or "Muse"
+        message = str(greeting.get("message") or "").strip()
+        return message or f"Hello, {agent_name} here. How can I help?"
+
+    async def _play_voice_join_greeting(self, guild_id: int, channel) -> bool:
+        greeting = self._voice_join_greeting_for_channel(channel)
+        if not greeting:
+            return False
+        audio_path = os.path.join(
+            tempfile.gettempdir(),
+            "hermes_voice",
+            f"join_greeting_{guild_id}_{int(time.time() * 1000)}.mp3",
+        )
+        actual_path = None
+        try:
+            os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+            from tools.tts_tool import text_to_speech_tool
+            result_json = await asyncio.to_thread(
+                text_to_speech_tool, text=greeting, output_path=audio_path
+            )
+            result = json.loads(result_json)
+            actual_path = result.get("file_path", audio_path)
+            if not result.get("success") or not os.path.isfile(actual_path):
+                logger.warning("Voice join greeting TTS failed: %s", result.get("error"))
+                return False
+            ok = await self.play_in_voice_channel(guild_id, actual_path)
+            if ok:
+                logger.info(
+                    "Voice join greeting played in %s (guild=%d)",
+                    getattr(channel, "name", channel),
+                    guild_id,
+                )
+            return ok
+        except Exception as e:
+            logger.warning("Voice join greeting failed: %s", e, exc_info=True)
+            return False
+        finally:
+            for p in {audio_path, actual_path}:
+                if p and os.path.isfile(p):
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+
     async def _maybe_auto_join_voice(self, member, before, after) -> None:
         """Auto-join an approved user's voice channel when configured.
 
@@ -4041,6 +4130,11 @@ class DiscordAdapter(BasePlatformAdapter):
             return
 
         try:
+            guild_id_int = int(guild_id)
+            current_vc = self._voice_clients.get(guild_id_int)
+            current_channel = getattr(current_vc, "channel", None) if current_vc and current_vc.is_connected() else None
+            current_channel_id = str(getattr(current_channel, "id", "") or "")
+            target_channel_id = str(getattr(target_channel, "id", "") or "")
             ok = await self.join_voice_channel(
                 target_channel,
                 text_channel_id=int(text_channel_id),
@@ -4054,6 +4148,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     getattr(member, "id", ""),
                     text_channel_id,
                 )
+                if current_channel_id != target_channel_id:
+                    await self._play_voice_join_greeting(guild_id_int, target_channel)
         except Exception as e:
             logger.warning("Voice auto-join failed for guild %s: %s", guild_id, e, exc_info=True)
 
@@ -4267,37 +4363,58 @@ class DiscordAdapter(BasePlatformAdapter):
         guild_id = channel.guild.id
 
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
+            def _store_voice_binding() -> None:
+                # Store text-channel binding for automatic/programmatic joins
+                # so voice transcriptions can be routed without /voice join.
+                # Refresh this even when the bot was already connected: auto-join
+                # may move between allowed voice channels in the same guild.
+                if text_channel_id is not None:
+                    self._voice_text_channels[guild_id] = text_channel_id
+                if source is not None:
+                    self._voice_sources[guild_id] = source
+
+            def _stop_voice_receiver_for_move() -> None:
+                receiver = self._voice_receivers.pop(guild_id, None)
+                if receiver:
+                    receiver.stop()
+                listen_task = self._voice_listen_tasks.pop(guild_id, None)
+                if listen_task:
+                    listen_task.cancel()
+
+            def _start_voice_receiver(vc) -> None:
+                try:
+                    receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+                    receiver.start()
+                    self._voice_receivers[guild_id] = receiver
+                    self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
+                        self._voice_listen_loop(guild_id)
+                    )
+                except Exception as e:
+                    logger.warning("Voice receiver failed to start: %s", e)
+
             # Already connected in this guild?
             existing = self._voice_clients.get(guild_id)
             if existing and existing.is_connected():
+                _store_voice_binding()
                 if existing.channel.id == channel.id:
+                    # A prior connection can survive while its receiver failed or
+                    # was stopped during a channel move. Ensure the listen path is
+                    # present for same-channel auto-join refreshes too.
+                    if guild_id not in self._voice_receivers:
+                        _start_voice_receiver(existing)
                     self._reset_voice_timeout(guild_id)
                     return True
+                _stop_voice_receiver_for_move()
                 await existing.move_to(channel)
+                _start_voice_receiver(existing)
                 self._reset_voice_timeout(guild_id)
                 return True
 
             vc = await channel.connect()
             self._voice_clients[guild_id] = vc
             self._reset_voice_timeout(guild_id)
-
-            # Store text-channel binding for automatic/programmatic joins
-            # so voice transcriptions can be routed without /voice join.
-            if text_channel_id is not None:
-                self._voice_text_channels[guild_id] = text_channel_id
-            if source is not None:
-                self._voice_sources[guild_id] = source
-
-            # Start voice receiver (Phase 2: listen to users)
-            try:
-                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
-                receiver.start()
-                self._voice_receivers[guild_id] = receiver
-                self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
-                    self._voice_listen_loop(guild_id)
-                )
-            except Exception as e:
-                logger.warning("Voice receiver failed to start: %s", e)
+            _store_voice_binding()
+            _start_voice_receiver(vc)
 
             # Phase 3: install the continuous mixer (ambient bed + ducked
             # speech).  Best-effort — if it fails we fall back to the legacy

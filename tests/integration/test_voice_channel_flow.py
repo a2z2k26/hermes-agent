@@ -8,10 +8,18 @@ Requires: PyNaCl>=1.5.0, discord.py[voice] (opus codec)
 """
 
 import struct
+import sys
 import time
 import pytest
 
-pytestmark = pytest.mark.integration
+# Several Discord gateway unit tests install lightweight fake ``discord``
+# modules into sys.modules. This integration suite exercises real discord.py
+# voice/Opus behavior, so clear those fakes before dependency detection when
+# the whole Discord test family is run in one process.
+if "discord" in sys.modules and not hasattr(sys.modules["discord"], "__file__"):
+    for _name in list(sys.modules):
+        if _name == "discord" or _name.startswith("discord."):
+            sys.modules.pop(_name, None)
 
 # Skip entire module if voice deps are missing
 pytest.importorskip("nacl.secret", reason="PyNaCl required for voice integration tests")
@@ -32,8 +40,22 @@ try:
         if opus_path:
             discord.opus.load_opus(opus_path)
     OPUS_AVAILABLE = discord.opus.is_loaded()
+    if OPUS_AVAILABLE:
+        # Some environments report Opus as loaded but cannot actually decode the
+        # tiny Discord silence frame used throughout this integration suite.
+        # Treat that the same as missing Opus so the dependency-gated suite is
+        # skipped rather than producing false audio-pipeline failures.
+        try:
+            OPUS_AVAILABLE = bool(discord.opus.Decoder().decode(b"\xf8\xff\xfe"))
+        except Exception:
+            OPUS_AVAILABLE = False
 except Exception:
     OPUS_AVAILABLE = False
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(not OPUS_AVAILABLE, reason="working Discord Opus decoder required"),
+]
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock

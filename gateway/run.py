@@ -18879,6 +18879,138 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         recent_store[key] = recent[-5:]
         return False
 
+    def _discord_council_mode_decision(
+        self, adapter: Any, guild_id: int, transcript: str
+    ) -> tuple[bool, Optional[str]]:
+        """Return whether Muse should answer a Discord VC utterance in council mode.
+
+        `bredren-voice` is a shared room: Muse should stay silent unless
+        directly addressed, explicitly included in a group round/open floor, or
+        assigned the floor. This is a local conservative gate; richer fleet-wide
+        floor control can be layered later without weakening this default.
+        """
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+        except Exception:
+            return True, None
+
+        council = ((cfg.get("discord") or {}).get("voice_council_mode") or {})
+        if not isinstance(council, dict) or not bool(council.get("enabled", False)):
+            return True, None
+
+        def _as_list(value: Any) -> list[Any]:
+            if value is None:
+                return []
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return []
+                if text.startswith("["):
+                    try:
+                        parsed = json.loads(text)
+                        if isinstance(parsed, list):
+                            return parsed
+                    except Exception:
+                        pass
+                return [text]
+            if isinstance(value, (list, tuple, set)):
+                return list(value)
+            return [value]
+
+        voice_clients = getattr(adapter, "_voice_clients", {})
+        if not isinstance(voice_clients, dict):
+            return True, None
+        vc = voice_clients.get(guild_id)
+        channel = getattr(vc, "channel", None) if vc and vc.is_connected() else None
+        if channel is None:
+            return True, None
+
+        channel_id = str(getattr(channel, "id", "") or "")
+        channel_name = str(getattr(channel, "name", "") or "").strip().lower()
+        council_ids = {str(v) for v in _as_list(council.get("channel_ids")) if str(v).strip()}
+        council_names = {
+            str(v).strip().lower()
+            for v in _as_list(council.get("channel_names"))
+            if str(v).strip()
+        }
+        in_council_room = (channel_id in council_ids) or (channel_name in council_names)
+        if not in_council_room:
+            return True, None
+
+        agent_name = str(council.get("agent_name") or "Muse").strip() or "Muse"
+        direct_names = [agent_name] + _as_list(council.get("direct_address_names"))
+        direct_terms = {
+            str(v).strip().lower()
+            for v in direct_names
+            if str(v).strip()
+        }
+        other_agents = {
+            str(v).strip().lower()
+            for v in _as_list(council.get("other_agent_names"))
+            if str(v).strip()
+        }
+
+        normalized = re.sub(r"[^a-z0-9'\s-]", " ", transcript.lower())
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+
+        def has_word(term: str) -> bool:
+            return bool(re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", normalized))
+
+        directly_addressed = any(has_word(term) for term in direct_terms)
+        if directly_addressed:
+            return True, self._discord_council_mode_prompt(agent_name)
+
+        silence_terms = ("stay quiet", "be quiet", "remain quiet", "silence", "mute")
+        if any(term in normalized for term in silence_terms):
+            logger.info(
+                "Discord council mode suppressed voice input in %s: silence cue",
+                getattr(channel, "name", channel),
+            )
+            return False, None
+
+        if any(has_word(term) for term in other_agents):
+            logger.info(
+                "Discord council mode suppressed voice input in %s: another agent was addressed",
+                getattr(channel, "name", channel),
+            )
+            return False, None
+
+        configured_group_terms = _as_list(council.get("group_invite_terms"))
+        group_terms = tuple(configured_group_terms or (
+            "everyone",
+            "everybody",
+            "all of you",
+            "you all",
+            "y'all",
+            "agents",
+            "council",
+            "round robin",
+            "round-robin",
+            "each of you",
+            "all think",
+            "weigh in",
+            "group round",
+        ))
+        if any(str(term).lower() in normalized for term in group_terms):
+            return True, self._discord_council_mode_prompt(agent_name)
+
+        logger.info(
+            "Discord council mode suppressed unaddressed voice input in %s",
+            getattr(channel, "name", channel),
+        )
+        return False, None
+
+    def _discord_council_mode_prompt(self, agent_name: str) -> str:
+        return (
+            f"Discord bredren-voice council mode is active. You are {agent_name}. "
+            "Do not give a join greeting. Speak only because this utterance "
+            "directly addressed you, explicitly invited a group round/open floor, "
+            "or assigned you the floor. Keep the spoken turn brief, usually 1-3 "
+            "sentences. Do not answer other agents by default; avoid crosstalk. "
+            "Default round-robin order is Marcion, Muse, Achilles, Bumba."
+        )
+
     async def _handle_voice_channel_input(
         self, guild_id: int, user_id: int, transcript: str
     ):
@@ -18931,6 +19063,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return
 
+        council_allowed, council_prompt = self._discord_council_mode_decision(
+            adapter, guild_id, transcript
+        )
+        if not council_allowed:
+            return
+
         # Show transcript in text channel (after auth, with mention sanitization)
         try:
             channel = adapter._client.get_channel(text_ch_id)
@@ -18948,12 +19086,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the same per-channel context as typed messages (#50149).
         channel_prompt: Optional[str] = None
         resolver = getattr(adapter, "_resolve_channel_prompt", None)
-        if callable(resolver):
+        if callable(resolver) and not inspect.iscoroutinefunction(resolver):
             try:
                 resolved = resolver(str(text_ch_id))
+                if inspect.isawaitable(resolved):
+                    resolved = None
                 channel_prompt = resolved if isinstance(resolved, str) else None
             except Exception:
                 channel_prompt = None
+        if council_prompt:
+            channel_prompt = (
+                f"{channel_prompt}\n\n{council_prompt}" if channel_prompt else council_prompt
+            )
         event = MessageEvent(
             source=source,
             text=transcript,
