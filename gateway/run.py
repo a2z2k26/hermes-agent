@@ -3518,6 +3518,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if mode in {"voice_only", "all"} and key.startswith(prefix)
             )
 
+    def _wire_voice_channel_callbacks(self, adapter) -> None:
+        """Wire Discord voice callbacks before manual or automatic voice joins."""
+        if hasattr(adapter, "_voice_input_callback"):
+            adapter._voice_input_callback = self._handle_voice_channel_input
+        if hasattr(adapter, "_on_voice_disconnect"):
+            adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
+        if hasattr(adapter, "_voice_mode_getter"):
+            adapter._voice_mode_getter = lambda chat_id: self._voice_mode.get(
+                self._voice_key(Platform.DISCORD, str(chat_id)), "off"
+            )
+        if hasattr(adapter, "_on_voice_auto_join"):
+            adapter._on_voice_auto_join = self._handle_voice_auto_join_state
+
+    def _handle_voice_auto_join_state(self, chat_id: str) -> None:
+        """Mirror manual /voice channel state for Discord auto-joined channels."""
+        self._voice_mode[self._voice_key(Platform.DISCORD, str(chat_id))] = "all"
+        self._save_voice_modes()
+        adapter = self.adapters.get(Platform.DISCORD)
+        self._set_adapter_auto_tts_enabled(adapter, str(chat_id), enabled=True)
+
     async def _safe_adapter_disconnect(self, adapter, platform) -> None:
         """Call adapter.disconnect() defensively, swallowing any error.
 
@@ -7334,6 +7354,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
             adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
             adapter._busy_text_mode = self._busy_text_mode
+            self._wire_voice_channel_callbacks(adapter)
             
             # Try to connect
             logger.info("Connecting to %s...", platform.value)
@@ -8200,6 +8221,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
                     adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
                     adapter._busy_text_mode = self._busy_text_mode
+                    self._wire_voice_channel_callbacks(adapter)
 
                     # Reconnect after an outage: preserve the platform's
                     # server-side update queue so messages sent while the bot
@@ -13453,6 +13475,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "all"
             self._save_voice_modes()
             self._set_adapter_auto_tts_enabled(adapter, event.source.chat_id, enabled=True)
+            play_greeting = getattr(adapter, "maybe_play_namesake_greeting", None)
+            if callable(play_greeting):
+                import inspect as _inspect
+                maybe_awaitable = play_greeting(voice_channel)
+                if _inspect.isawaitable(maybe_awaitable):
+                    await maybe_awaitable
             return (
                 f"Joined voice channel **{voice_channel.name}**.\n"
                 f"I'll speak my replies and listen to you. Use /voice leave to disconnect."
@@ -13493,6 +13521,68 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._save_voice_modes()
         adapter = self.adapters.get(Platform.DISCORD)
         self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
+
+    @staticmethod
+    def _normalise_spoken_text(text: str) -> str:
+        return re.sub(r"[^a-z0-9\s]", " ", text.lower()).strip()
+
+    def _discord_current_voice_channel_id(self, adapter: Any, guild_id: int) -> Optional[str]:
+        clients = getattr(adapter, "_voice_clients", None)
+        if not isinstance(clients, dict):
+            return None
+        vc = clients.get(guild_id)
+        channel = getattr(vc, "channel", None) if vc else None
+        channel_id = getattr(channel, "id", None)
+        if isinstance(channel_id, (str, int)):
+            return str(channel_id)
+        return None
+
+    def _discord_council_allows_bumba_response(self, adapter: Any, guild_id: int, transcript: str) -> bool:
+        """Return whether Bumba should answer a voice transcript in council mode.
+
+        This is intentionally conservative for shared rooms: in bredren-voice,
+        answer only when Bumba is directly addressed, explicitly included in a
+        group/council round, or assigned the floor. Namesake rooms are not
+        governed by council-mode suppression.
+        """
+        channel_id = self._discord_current_voice_channel_id(adapter, guild_id)
+        council_ids_raw = os.getenv("HERMES_DISCORD_COUNCIL_MODE_CHANNEL_IDS", "")
+        council_ids: set[str] = set()
+        if council_ids_raw.strip():
+            try:
+                parsed = json.loads(council_ids_raw)
+            except Exception:
+                parsed = council_ids_raw
+            if isinstance(parsed, list):
+                council_ids = {str(v).strip() for v in parsed if str(v).strip()}
+            else:
+                council_ids = {v.strip() for v in str(parsed).split(",") if v.strip()}
+        if not channel_id or channel_id not in council_ids:
+            return True
+
+        text = self._normalise_spoken_text(transcript)
+        words = set(text.split())
+        if "bumba" in words:
+            return True
+
+        invite_phrases = (
+            "what do you all think",
+            "agents weigh in",
+            "council mode",
+            "everyone answer",
+            "hear from everyone",
+            "round robin",
+            "group round",
+            "all agents",
+            "everyone weigh in",
+            "assigned the floor",
+            "bumba has the floor",
+            "give bumba the floor",
+        )
+        if any(phrase in text for phrase in invite_phrases):
+            return True
+
+        return False
 
     def _is_duplicate_voice_transcript(self, guild_id: int, user_id: int, transcript: str) -> bool:
         """Suppress repeated STT outputs for the same recent utterance.
@@ -13590,6 +13680,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+        # In shared BREDREN council rooms, stay silent unless directly addressed,
+        # invited into a group round, or assigned the floor.  Transcript echo is
+        # still allowed above so the human can see what was heard.
+        if not self._discord_council_allows_bumba_response(adapter, guild_id, transcript):
+            logger.info(
+                "Council mode suppressed Bumba voice response for guild=%s user=%s: %s",
+                guild_id,
+                user_id,
+                transcript[:100],
+            )
+            return
+
         # Build a synthetic MessageEvent and feed through the normal pipeline
         # Use SimpleNamespace as raw_message so _get_guild_id() can extract
         # guild_id and _send_voice_reply() plays audio in the voice channel.
@@ -13647,13 +13749,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if has_agent_tts:
             return False
 
-        # Dedup: base adapter auto-TTS already handles voice input
-        # (play_tts plays in VC when connected, so runner can skip).
-        # When streaming already delivered the text (already_sent=True),
-        # the base adapter will receive None and can't run auto-TTS,
-        # so the runner must take over.
+        # Dedup: base adapter auto-TTS already handles voice input for most
+        # platforms. Discord live VC sessions are the exception here: route them
+        # through _send_voice_reply so the runner can call play_in_voice_channel()
+        # directly instead of allowing a stale/missing chat→guild mapping to
+        # degrade into an uploaded audio attachment.
         if is_voice_input and not already_sent:
-            return False
+            if event.source.platform != Platform.DISCORD:
+                return False
+            adapter = self.adapters.get(Platform.DISCORD)
+            guild_id = self._get_guild_id(event)
+            is_in_voice = getattr(adapter, "is_in_voice_channel", None)
+            if not (
+                guild_id
+                and callable(is_in_voice)
+                and is_in_voice(guild_id)
+            ):
+                return False
 
         return True
 

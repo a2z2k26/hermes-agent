@@ -583,15 +583,51 @@ class TestDiscordPlayTtsSkip:
         assert result.success is False
 
     @pytest.mark.asyncio
-    async def test_play_tts_not_skipped_for_different_channel(self):
+    async def test_play_tts_uses_sole_live_vc_for_different_channel(self):
         adapter = self._make_discord_adapter()
         mock_vc = MagicMock()
         mock_vc.is_connected.return_value = True
         adapter._voice_clients[111] = mock_vc
-        adapter._voice_text_channels[111] = 999  # different channel
+        adapter._voice_text_channels[111] = 999  # stale/different channel mapping
+
+        played = []
+        async def fake_play(guild_id: int, audio_path: str) -> bool:
+            played.append((guild_id, audio_path))
+            return True
+        adapter.play_in_voice_channel = fake_play
 
         result = await adapter.play_tts(chat_id="123", audio_path="/tmp/test.ogg")
-        # Different channel — should NOT skip, falls through to send_voice (fails)
+        # With exactly one live Discord VC, prefer live playback over uploading
+        # the generated TTS file to chat, even if text-channel mapping is stale.
+        assert result.success is True
+        assert played == [(111, "/tmp/test.ogg")]
+
+    @pytest.mark.asyncio
+    async def test_send_voice_plays_in_linked_vc_instead_of_uploading(self):
+        adapter = self._make_discord_adapter()
+        mock_vc = MagicMock()
+        mock_vc.is_connected.return_value = True
+        adapter._voice_clients[111] = mock_vc
+        adapter._voice_text_channels[111] = 123
+        mock_client = MagicMock()
+        adapter._client = mock_client
+
+        played = []
+        async def fake_play(guild_id: int, audio_path: str) -> bool:
+            played.append((guild_id, audio_path))
+            return True
+        adapter.play_in_voice_channel = fake_play
+
+        result = await adapter.send_voice(chat_id="123", audio_path="/tmp/voice-message.ogg")
+        assert result.success is True
+        assert played == [(111, "/tmp/voice-message.ogg")]
+        mock_client.get_channel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_voice_uses_attachment_only_without_live_vc(self):
+        adapter = self._make_discord_adapter()
+        # No active voice client: attachment fallback remains allowed.
+        result = await adapter.send_voice(chat_id="123", audio_path="/tmp/voice-message.ogg")
         assert result.success is False
 
 
@@ -1106,6 +1142,7 @@ class TestDiscordVoiceChannelMethods:
         adapter._voice_timeout_tasks = {}
         adapter._voice_receivers = {}
         adapter._voice_listen_tasks = {}
+        adapter._voice_greeted_channel_ids = set()
         adapter._voice_input_callback = None
         adapter._allowed_user_ids = set()
         adapter._running = True
@@ -1135,9 +1172,11 @@ class TestDiscordVoiceChannelMethods:
         mock_vc = MagicMock()
         mock_vc.is_connected.return_value = True
         mock_vc.disconnect = AsyncMock()
+        mock_vc.channel = SimpleNamespace(id=1534095282114002964)
         adapter._voice_clients[111] = mock_vc
         adapter._voice_text_channels[111] = 123
         adapter._voice_sources[111] = {"chat_id": "123", "chat_type": "group"}
+        adapter._voice_greeted_channel_ids.add("1534095282114002964")
 
         mock_receiver = MagicMock()
         adapter._voice_receivers[111] = mock_receiver
@@ -1158,6 +1197,28 @@ class TestDiscordVoiceChannelMethods:
         assert 111 not in adapter._voice_text_channels
         assert 111 not in adapter._voice_sources
         assert 111 not in adapter._voice_receivers
+        assert "1534095282114002964" not in adapter._voice_greeted_channel_ids
+
+    @pytest.mark.asyncio
+    async def test_join_move_clears_old_namesake_greeting_marker(self):
+        """Moving away from bumba-voice lets a later fresh join greet again."""
+        adapter = self._make_adapter()
+        existing = MagicMock()
+        existing.is_connected.return_value = True
+        existing.channel = SimpleNamespace(id=1534095282114002964)
+        existing.move_to = AsyncMock()
+        adapter._voice_clients[111] = existing
+        adapter._voice_greeted_channel_ids.add("1534095282114002964")
+
+        new_channel = MagicMock()
+        new_channel.id = 1476645830898483346
+        new_channel.guild.id = 111
+
+        result = await adapter.join_voice_channel(new_channel)
+
+        assert result is True
+        existing.move_to.assert_called_once_with(new_channel)
+        assert "1534095282114002964" not in adapter._voice_greeted_channel_ids
 
     @pytest.mark.asyncio
     async def test_leave_voice_channel_no_connection(self):
@@ -2732,8 +2793,8 @@ class TestVoiceTTSPlayback:
         adapter.send_voice.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_play_tts_wrong_channel_no_match(self):
-        """play_tts doesn't match if chat_id is for a different channel."""
+    async def test_play_tts_uses_sole_live_vc_for_wrong_channel(self):
+        """With one live VC, play TTS there instead of uploading to chat."""
         adapter = self._make_discord_adapter()
         mock_vc = MagicMock()
         mock_vc.is_connected.return_value = True
@@ -2742,9 +2803,16 @@ class TestVoiceTTSPlayback:
 
         from gateway.platforms.base import SendResult
         adapter.send_voice = AsyncMock(return_value=SendResult(success=True))
-        # Different chat_id — shouldn't match VC
+        played = []
+        async def fake_play(guild_id, audio_path):
+            played.append((guild_id, audio_path))
+            return True
+        adapter.play_in_voice_channel = fake_play
+
         result = await adapter.play_tts(chat_id="999", audio_path="/tmp/tts.ogg")
-        adapter.send_voice.assert_called_once()
+        assert result.success is True
+        assert played == [(111, "/tmp/tts.ogg")]
+        adapter.send_voice.assert_not_called()
 
     # -- Runner dedup --
 
