@@ -1358,14 +1358,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             @self._client.event
             async def on_voice_state_update(member, before, after):
-                """Track voice channel join/leave events."""
-                # Only track channels where the bot is connected
-                bot_guild_ids = set(adapter_self._voice_clients.keys())
-                if not bot_guild_ids:
-                    return
-                guild_id = member.guild.id
-                if guild_id not in bot_guild_ids:
-                    return
+                """Track voice channel join/leave events and optional auto-join."""
                 # Ignore the bot itself
                 if member == adapter_self._client.user:
                     return
@@ -1377,6 +1370,19 @@ class DiscordAdapter(BasePlatformAdapter):
                     and after.channel is not None
                     and before.channel != after.channel
                 )
+
+                if (joined or switched) and after.channel is not None:
+                    await adapter_self._maybe_auto_join_voice_channel(member, after.channel)
+                if (left or switched) and before.channel is not None:
+                    await adapter_self._maybe_auto_leave_voice_channel(member, before.channel)
+
+                # Only track channel awareness logs for guilds where the bot is connected.
+                bot_guild_ids = set(adapter_self._voice_clients.keys())
+                if not bot_guild_ids:
+                    return
+                guild_id = member.guild.id
+                if guild_id not in bot_guild_ids:
+                    return
 
                 if joined or left or switched:
                     logger.info(
@@ -4146,6 +4152,160 @@ class DiscordAdapter(BasePlatformAdapter):
         """True when a continuous mixer is installed for this guild."""
         mixers = getattr(self, "_voice_mixers", None)
         return bool(mixers) and mixers.get(guild_id) is not None
+
+    @staticmethod
+    def _env_flag(name: str) -> bool:
+        return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _csv_env_values(*names: str) -> set[str]:
+        values: set[str] = set()
+        for name in names:
+            for item in os.environ.get(name, "").split(","):
+                item = item.strip()
+                if item:
+                    values.add(item)
+        return values
+
+    def _auto_voice_channel_ids(self) -> set[str]:
+        return self._csv_env_values(
+            "DISCORD_AUTO_VOICE_CHANNELS",
+            "DISCORD_AUTO_VOICE_CHANNEL",
+            "DISCORD_ALLOWED_VOICE_CHANNELS",
+        )
+
+    def _auto_voice_text_channel_id(self) -> Optional[int]:
+        raw = (
+            os.environ.get("DISCORD_AUTO_VOICE_TEXT_CHANNEL")
+            or os.environ.get("DISCORD_AUTO_VOICE_DM_CHANNEL")
+            or ""
+        ).strip()
+        if not raw:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            logger.warning("Invalid DISCORD_AUTO_VOICE_TEXT_CHANNEL=%r", raw)
+            return None
+
+    def _auto_voice_source_for_member(self, member, text_channel_id: int) -> Dict[str, Any]:
+        guild_id = str(getattr(getattr(member, "guild", None), "id", "") or "")
+        return {
+            "platform": Platform.DISCORD.value,
+            "chat_id": str(text_channel_id),
+            "chat_name": f"DM with {getattr(member, 'display_name', member.id)}",
+            "chat_type": "dm",
+            "user_id": str(member.id),
+            "user_name": str(getattr(member, "display_name", member.id)),
+            "scope_id": guild_id,
+            "guild_id": guild_id,
+        }
+
+    async def _speak_auto_voice_greeting(self, guild_id: int) -> bool:
+        greeting = os.environ.get("DISCORD_VOICE_JOIN_GREETING", "").strip()
+        if not greeting:
+            return False
+        audio_path = os.path.join(
+            tempfile.gettempdir(),
+            "hermes_voice",
+            f"auto_join_greeting_{guild_id}_{int(time.time() * 1000)}.mp3",
+        )
+        os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+        actual_paths: List[str] = []
+        try:
+            from tools.tts_tool import text_to_speech_tool
+
+            result_json = await asyncio.to_thread(
+                text_to_speech_tool, text=greeting, output_path=audio_path
+            )
+            result = json.loads(result_json)
+            actual_paths = result.get("file_paths") or [result.get("file_path", audio_path)]
+            actual_paths = [str(path) for path in actual_paths if path and os.path.isfile(path)]
+            if not result.get("success") or not actual_paths:
+                logger.warning("Auto voice greeting TTS failed: %s", result.get("error"))
+                return False
+            played = False
+            for path in actual_paths:
+                played = bool(await self.play_in_voice_channel(guild_id, path)) or played
+            return played
+        except Exception as e:
+            logger.warning("Auto voice greeting playback failed: %s", e, exc_info=True)
+            return False
+        finally:
+            for p in ({audio_path, *actual_paths} - {None}):
+                if p and os.path.isfile(p):
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+
+    async def _maybe_auto_join_voice_channel(self, member, channel) -> bool:
+        """Join the configured Apollo VC when an allowed user enters it."""
+        if not self._env_flag("DISCORD_AUTO_VOICE_JOIN"):
+            return False
+        if getattr(member, "bot", False):
+            return False
+        allowed_channel_ids = self._auto_voice_channel_ids()
+        if allowed_channel_ids and str(getattr(channel, "id", "")) not in allowed_channel_ids:
+            return False
+        guild = getattr(member, "guild", None)
+        guild_id = int(getattr(guild, "id", 0) or 0)
+        if not guild_id:
+            return False
+        if not self._is_allowed_user(str(member.id), guild=guild, is_dm=False):
+            logger.debug("Ignoring auto voice join for unauthorized user %s", member.id)
+            return False
+        text_channel_id = self._auto_voice_text_channel_id()
+        if text_channel_id is None:
+            logger.warning("Auto voice join enabled but DISCORD_AUTO_VOICE_TEXT_CHANNEL is unset")
+            return False
+        existing = self._voice_clients.get(guild_id)
+        if existing and existing.is_connected() and getattr(existing.channel, "id", None) == getattr(channel, "id", None):
+            return False
+        logger.info(
+            "Auto voice join: user=%s channel=%s guild=%s text_channel=%s",
+            member.id,
+            getattr(channel, "id", None),
+            guild_id,
+            text_channel_id,
+        )
+        source = self._auto_voice_source_for_member(member, text_channel_id)
+        ok = await self.join_voice_channel(channel, text_channel_id=text_channel_id, source=source)
+        if not ok:
+            return False
+        enabled_chats = getattr(self, "_auto_tts_enabled_chats", None)
+        if isinstance(enabled_chats, set):
+            enabled_chats.add(str(text_channel_id))
+        disabled_chats = getattr(self, "_auto_tts_disabled_chats", None)
+        if isinstance(disabled_chats, set):
+            disabled_chats.discard(str(text_channel_id))
+        await self._speak_auto_voice_greeting(guild_id)
+        return True
+
+    async def _maybe_auto_leave_voice_channel(self, member, channel) -> bool:
+        """Leave the configured Apollo VC when no allowed non-bot users remain."""
+        if not self._env_flag("DISCORD_AUTO_VOICE_JOIN"):
+            return False
+        allowed_channel_ids = self._auto_voice_channel_ids()
+        if allowed_channel_ids and str(getattr(channel, "id", "")) not in allowed_channel_ids:
+            return False
+        guild = getattr(member, "guild", None)
+        guild_id = int(getattr(guild, "id", 0) or 0)
+        if not guild_id or not self.is_in_voice_channel(guild_id):
+            return False
+        vc = self._voice_clients.get(guild_id)
+        if not vc or getattr(getattr(vc, "channel", None), "id", None) != getattr(channel, "id", None):
+            return False
+        remaining_allowed_users = [
+            m for m in getattr(channel, "members", [])
+            if not getattr(m, "bot", False)
+            and self._is_allowed_user(str(m.id), guild=getattr(m, "guild", guild), is_dm=False)
+        ]
+        if remaining_allowed_users:
+            return False
+        logger.info("Auto voice leave: no allowed users remain in channel=%s guild=%s", getattr(channel, "id", None), guild_id)
+        await self.leave_voice_channel(guild_id)
+        return True
 
     async def join_voice_channel(self, channel, *, text_channel_id: int = None, source: dict = None) -> bool:
         """Join a Discord voice channel. Returns True on success.

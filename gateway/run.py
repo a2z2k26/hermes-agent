@@ -19677,21 +19677,146 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return None
 
 
+    def _voice_event_guild_id(self, event: MessageEvent, adapter: Any = None) -> Optional[int]:
+        """Resolve the active Discord VC guild for server or DM-bound voice sessions."""
+        guild_id = self._get_guild_id(event)
+        if guild_id:
+            return guild_id
+        if adapter is not None:
+            chat_id = str(getattr(event.source, "chat_id", ""))
+            for gid, text_channel_id in getattr(adapter, "_voice_text_channels", {}).items():
+                if str(text_channel_id) == chat_id:
+                    try:
+                        return int(gid)
+                    except (TypeError, ValueError):
+                        return None
+        return None
+
+    @staticmethod
+    def _discord_dm_voice_join_enabled() -> bool:
+        """Return whether /voice join from DM may use the configured VC allowlist."""
+        return os.environ.get("DISCORD_DM_VOICE_JOIN", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    async def _configured_discord_voice_channel(self, adapter: Any):
+        """Resolve the single configured Discord voice channel for DM /voice join."""
+        if not self._discord_dm_voice_join_enabled():
+            return None
+        allowed_voice_channel_ids = {
+            item.strip()
+            for item in os.environ.get("DISCORD_ALLOWED_VOICE_CHANNELS", "").split(",")
+            if item.strip()
+        }
+        if len(allowed_voice_channel_ids) != 1:
+            return None
+        channel_id = next(iter(allowed_voice_channel_ids))
+        try:
+            numeric_channel_id = int(channel_id)
+        except (TypeError, ValueError):
+            return None
+        client = getattr(adapter, "client", None) or getattr(adapter, "_client", None)
+        if client is None:
+            return None
+        channel = None
+        get_channel = getattr(client, "get_channel", None)
+        if callable(get_channel):
+            channel = get_channel(numeric_channel_id)
+        fetch_channel = getattr(client, "fetch_channel", None)
+        if channel is None and callable(fetch_channel):
+            fetch_result = fetch_channel(numeric_channel_id)
+            if inspect.isawaitable(fetch_result):
+                channel = await fetch_result
+            else:
+                channel = fetch_result
+        return channel
+
+    async def _play_voice_join_greeting(self, adapter: Any, guild_id: int, event: MessageEvent) -> bool:
+        """Play an env-configured greeting in the active Discord voice channel."""
+        greeting = os.environ.get("DISCORD_VOICE_JOIN_GREETING", "").strip()
+        if not greeting:
+            return False
+        play_in_voice_channel = getattr(adapter, "play_in_voice_channel", None)
+        is_in_voice_channel = getattr(adapter, "is_in_voice_channel", None)
+        if not callable(play_in_voice_channel) or not callable(is_in_voice_channel):
+            return False
+        if not is_in_voice_channel(guild_id):
+            return False
+
+        audio_path = None
+        actual_paths: List[str] = []
+        try:
+            from tools.tts_tool import text_to_speech_tool
+
+            audio_path = build_auto_tts_output_path(event.source.platform)
+            result_json = await asyncio.to_thread(
+                text_to_speech_tool, text=greeting, output_path=audio_path
+            )
+            try:
+                result = json.loads(result_json)
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("Voice join greeting TTS returned invalid JSON: %s", result_json[:200] if result_json else result_json)
+                return False
+            actual_paths = result.get("file_paths") or [result.get("file_path", audio_path)]
+            actual_paths = [str(path) for path in actual_paths if path and os.path.isfile(path)]
+            if not result.get("success") or not actual_paths:
+                logger.warning("Voice join greeting TTS failed: %s", result.get("error"))
+                return False
+            played = False
+            for actual_path in actual_paths:
+                played = bool(await play_in_voice_channel(guild_id, actual_path)) or played
+            return played
+        except Exception as e:
+            logger.warning("Voice join greeting playback failed: %s", e, exc_info=True)
+            return False
+        finally:
+            for p in ({audio_path, *actual_paths} - {None}):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
-        """Join the user's current Discord voice channel."""
-        adapter = self._adapter_for_source(event.source)
+        """Join the user's current Discord voice channel, or a configured VC from DM."""
+        adapter = cast(Any, self._adapter_for_source(event.source))
         if not hasattr(adapter, "join_voice_channel"):
             return "Voice channels are not supported on this platform."
 
-        guild_id = self._get_guild_id(event)
-        if not guild_id:
-            return "This command only works in a Discord server."
+        # Optional deployment guard: when set, Hermes may only join the
+        # configured Discord voice channel(s).  This protects shared servers
+        # from accidental /voice join calls in the wrong VC.
+        allowed_voice_channel_ids = {
+            item.strip()
+            for item in os.environ.get("DISCORD_ALLOWED_VOICE_CHANNELS", "").split(",")
+            if item.strip()
+        }
 
-        voice_channel = await adapter.get_user_voice_channel(
-            guild_id, event.source.user_id
-        )
-        if not voice_channel:
-            return "You need to be in a voice channel first."
+        guild_id = self._get_guild_id(event)
+        voice_channel = None
+        if not guild_id:
+            voice_channel = await self._configured_discord_voice_channel(adapter)
+            if voice_channel is None:
+                return "This command only works in a Discord server."
+            guild = getattr(voice_channel, "guild", None)
+            guild_id = int(getattr(guild, "id", 0) or 0)
+            if not guild_id:
+                return "Could not resolve the configured Discord voice channel's server."
+
+        if voice_channel is None:
+            voice_channel = await adapter.get_user_voice_channel(
+                guild_id, event.source.user_id
+            )
+            if not voice_channel:
+                return "You need to be in a voice channel first."
+
+        if allowed_voice_channel_ids and str(getattr(voice_channel, "id", "")) not in allowed_voice_channel_ids:
+            allowed_channels = ", ".join(
+                f"<#{channel_id}>" for channel_id in sorted(allowed_voice_channel_ids)
+            )
+            return f"I can only join the configured voice channel: {allowed_channels}."
 
         # Wire callbacks BEFORE join so voice input arriving immediately
         # after connection is not lost.
@@ -19726,9 +19851,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "all"
             self._save_voice_modes()
             self._set_adapter_auto_tts_enabled(adapter, event.source.chat_id, enabled=True)
+            greeting_played = await self._play_voice_join_greeting(adapter, guild_id, event)
+            greeting_note = "\nGreeting played in the voice channel." if greeting_played else ""
+            voice_channel_name = getattr(voice_channel, "name", "configured voice channel")
             return (
-                f"Joined voice channel **{voice_channel.name}**.\n"
+                f"Joined voice channel **{voice_channel_name}**.\n"
                 f"I'll speak my replies and listen to you. Use /voice leave to disconnect."
+                f"{greeting_note}"
             )
         # Join failed — clear callback
         adapter._voice_input_callback = None
@@ -19736,8 +19865,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_voice_channel_leave(self, event: MessageEvent) -> str:
         """Leave the Discord voice channel."""
-        adapter = self._adapter_for_source(event.source)
-        guild_id = self._get_guild_id(event)
+        adapter = cast(Any, self._adapter_for_source(event.source))
+        guild_id = self._voice_event_guild_id(event, adapter)
 
         if not guild_id or not hasattr(adapter, "leave_voice_channel"):
             return "Not in a voice channel."
@@ -20011,7 +20140,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter = self._adapter_for_source(event.source)
 
             # If connected to a voice channel, play there instead of sending a file
-            guild_id = self._get_guild_id(event)
+            guild_id = self._voice_event_guild_id(event, adapter)
             play_in_voice_channel = getattr(adapter, "play_in_voice_channel", None)
             is_in_voice_channel = getattr(adapter, "is_in_voice_channel", None)
             send_voice = getattr(adapter, "send_voice", None)

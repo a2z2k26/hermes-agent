@@ -3103,7 +3103,13 @@ class GatewaySlashCommandsMixin:
             }
             # Append voice channel info if connected
             adapter = self.adapters.get(event.source.platform)
-            guild_id = self._get_guild_id(event)
+            resolve_voice_guild = getattr(self, "_voice_event_guild_id", None)
+            resolve_guild = getattr(self, "_get_guild_id", None)
+            guild_id = (
+                resolve_voice_guild(event, adapter)
+                if callable(resolve_voice_guild)
+                else (resolve_guild(event) if callable(resolve_guild) else None)
+            )
             if guild_id and hasattr(adapter, "get_voice_channel_info"):
                 info = adapter.get_voice_channel_info(guild_id)
                 if info:
