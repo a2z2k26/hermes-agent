@@ -1026,6 +1026,11 @@ class DiscordAdapter(BasePlatformAdapter):
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
         self._allowed_role_ids: set = set()  # For DISCORD_ALLOWED_ROLES filtering
+        # Last successful automatic voice join time per guild. Used to avoid
+        # racing Discord voice-state membership cache updates immediately after
+        # joining; without a short grace window auto-leave can disconnect before
+        # the greeting/STT path has a chance to run.
+        self._auto_voice_joined_at: Dict[int, float] = {}
         # Per-adapter snapshot of authorization gate env vars, captured inside
         # the owning profile's runtime scope during connect(). None until then;
         # accessors fall back to live scope-aware reads (issue #72348).
@@ -4273,6 +4278,7 @@ class DiscordAdapter(BasePlatformAdapter):
         ok = await self.join_voice_channel(channel, text_channel_id=text_channel_id, source=source)
         if not ok:
             return False
+        self._auto_voice_joined_at[guild_id] = time.monotonic()
         enabled_chats = getattr(self, "_auto_tts_enabled_chats", None)
         if isinstance(enabled_chats, set):
             enabled_chats.add(str(text_channel_id))
@@ -4295,6 +4301,16 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
         vc = self._voice_clients.get(guild_id)
         if not vc or getattr(getattr(vc, "channel", None), "id", None) != getattr(channel, "id", None):
+            return False
+        grace_seconds = float(os.environ.get("DISCORD_AUTO_VOICE_LEAVE_GRACE_SECONDS", "8") or 8)
+        joined_at = self._auto_voice_joined_at.get(guild_id)
+        if joined_at is not None and time.monotonic() - joined_at < grace_seconds:
+            logger.debug(
+                "Skipping auto voice leave during %.1fs join grace for channel=%s guild=%s",
+                grace_seconds,
+                getattr(channel, "id", None),
+                guild_id,
+            )
             return False
         remaining_allowed_users = [
             m for m in getattr(channel, "members", [])
@@ -4399,6 +4415,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 task.cancel()
             self._voice_text_channels.pop(guild_id, None)
             self._voice_sources.pop(guild_id, None)
+            self._auto_voice_joined_at.pop(guild_id, None)
 
     async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
         """Play an audio file in the connected voice channel.
