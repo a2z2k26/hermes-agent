@@ -210,6 +210,270 @@ def _truncate_discord_component_text(text: str, limit: int) -> str:
     return _prefix_within_utf16_limit(str(text or ""), max(0, limit))
 
 
+_INBOX_REVIEW_TRIGGERS = {
+    "inbox",
+    "inbox review",
+    "/inbox review",
+    "o inbox",
+    "review inbox",
+    "review screenshots",
+    "review captures",
+    "/review-inbox",
+    "/review_inbox",
+}
+
+_INBOX_REVIEW_STOP_TRIGGERS = {
+    "stop review",
+    "stop inbox",
+    "cancel review",
+    "cancel inbox",
+    "end review",
+    "end inbox",
+}
+
+
+def _normalize_inbox_review_trigger(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _is_inbox_review_trigger(text: str) -> bool:
+    return _normalize_inbox_review_trigger(text) in _INBOX_REVIEW_TRIGGERS
+
+
+def _is_inbox_review_stop_trigger(text: str) -> bool:
+    return _normalize_inbox_review_trigger(text) in _INBOX_REVIEW_STOP_TRIGGERS
+
+
+def _inbox_review_action_label(action: str) -> str:
+    return {
+        "brain": "Brain / Knowledge",
+        "second-brain": "Brain / Knowledge",
+        "studio": "Studio / Creative",
+        "creative-studio": "Studio / Creative",
+        "receipt": "Receipt",
+        "event": "Calendar Event",
+        "calendar-event": "Calendar Event",
+        "job": "Job Opportunity",
+        "job-opportunity": "Job Opportunity",
+        "github": "GitHub Repo / Project",
+        "github-repository": "GitHub Repo / Project",
+        "negative": "Negative Reference",
+        "negative-reference": "Negative Reference",
+        "delete": "Delete from Vault",
+    }.get(action, str(action).replace("-", " ").title())
+
+
+if DISCORD_AVAILABLE:
+    class InboxReviewView(discord.ui.View):
+        """Discord-native review card for Obsidian Inbox items."""
+
+        ACTION_OPTIONS = [
+            ("Brain / Knowledge [b/k]", "brain", "Promote/mark as Knowledge Base"),
+            ("Studio / Creative [s]", "studio", "Promote/mark as Creative Studio"),
+            ("Receipt [r]", "receipt", "Classify as receipt/bill/expense"),
+            ("Calendar Event [c]", "event", "Classify as calendar/event candidate"),
+            ("Job Description [j]", "job-opportunity", "Classify as job opportunity"),
+            ("GitHub Repo / Project [g]", "github-repository", "Classify as GitHub repo/project"),
+            ("Negative Reference [x]", "negative-reference", "Classify as anti-pattern/reference"),
+            ("Delete from Vault [d]", "delete", "Delete staged vault note/copy with ledger"),
+        ]
+
+        def __init__(
+            self,
+            *,
+            manager: Any,
+            items: list[Any],
+            session_id: str,
+            allowed_user_ids: set[int] | set[str],
+            allowed_role_ids: set[int] | set[str] | None = None,
+            allow_delete: bool = False,
+        ) -> None:
+            super().__init__(timeout=2 * 60 * 60)
+            self.manager = manager
+            self.items = list(items or [])
+            self.session_id = session_id
+            self.allowed_user_ids = {str(x) for x in (allowed_user_ids or set())}
+            self.allowed_role_ids = {str(x) for x in (allowed_role_ids or set())}
+            self.allow_delete = bool(allow_delete)
+            self.index = 0
+            self.decisions: list[dict[str, Any]] = []
+            self.message = None
+
+            options = [
+                discord.SelectOption(label=label, value=value, description=desc)
+                for label, value, desc in self.ACTION_OPTIONS
+            ]
+            select = discord.ui.Select(
+                placeholder="Choose primary action...",
+                min_values=1,
+                max_values=1,
+                options=options,
+                row=0,
+            )
+
+            async def _select_callback(interaction: discord.Interaction) -> None:
+                await self._apply_review_action(interaction, select.values[0])
+
+            select.callback = _select_callback
+            self.add_item(select)
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            user = getattr(interaction, "user", None)
+            if not self.allowed_user_ids and not self.allowed_role_ids:
+                return True
+            if str(getattr(user, "id", "")) in self.allowed_user_ids:
+                return True
+            for role in getattr(user, "roles", []) or []:
+                if str(getattr(role, "id", "")) in self.allowed_role_ids:
+                    return True
+            return False
+
+        def _current_item(self):
+            if not self.items:
+                return None
+            self.index = max(0, min(self.index, len(self.items) - 1))
+            return self.items[self.index]
+
+        def _item_location(self, item: Any) -> str:
+            note = getattr(item, "note_path", None)
+            vault = getattr(self.manager, "vault_path", None)
+            try:
+                rel = _Path(note).relative_to(_Path(vault))
+                parent = rel.parent.as_posix()
+            except Exception:
+                try:
+                    parent = _Path(note).parent.as_posix()
+                except Exception:
+                    parent = "unknown"
+            return f"`{parent}`"
+
+        def build_current_payload(self, *, include_preview: bool = True):
+            item = self._current_item()
+            if item is None:
+                embed = discord.Embed(title="Inbox Review Complete", description=self._decision_summary_text())
+                return embed, None
+            title = str(getattr(item, "title", "Inbox Item") or "Inbox Item")
+            kind = "Screenshot" if "screenshot" in title.lower() else "Inbox Item"
+            embed = discord.Embed(
+                title=f"Inbox Review {self.index + 1}/{len(self.items)} · {kind}",
+                description=_truncate_discord_component_text(str(getattr(item, "excerpt", "") or "No excerpt available."), 900),
+            )
+            suggested = str(getattr(item, "suggested_route", "") or "unknown")
+            embed.add_field(name="Recommended primary action", value=_inbox_review_action_label(suggested), inline=False)
+            embed.add_field(name="Confidence", value=str(getattr(item, "confidence", "unknown") or "unknown"), inline=True)
+            embed.add_field(name="Location", value=self._item_location(item), inline=True)
+            embed.set_footer(text="Intent tags can be added later. Text fallback: stop review / stop inbox.")
+            file_obj = None
+            if include_preview and self.manager is not None:
+                try:
+                    preview = self.manager.create_preview(item, self.session_id)
+                    if preview:
+                        file_obj = discord.File(str(preview), filename=_Path(preview).name)
+                        embed.set_image(url=f"attachment://{_Path(preview).name}")
+                except Exception as exc:
+                    logger.debug("Inbox Review preview generation failed: %s", exc, exc_info=True)
+            return embed, file_obj
+
+        def _decision_summary_text(self, cleanup_report: dict[str, int] | None = None) -> str:
+            counts: dict[str, int] = {}
+            for decision in self.decisions:
+                action = str(decision.get("action") or "unknown")
+                counts[action] = counts.get(action, 0) + 1
+            lines = ["Review session complete."]
+            if counts:
+                lines.append("Decisions: " + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
+            if cleanup_report:
+                lines.append(
+                    "Temporary preview cleanup: "
+                    f"{cleanup_report.get('removed_files', 0)} file(s), "
+                    f"{cleanup_report.get('removed_dirs', 0)} dir(s), "
+                    f"{cleanup_report.get('skipped', 0)} skipped"
+                )
+            return "\n".join(lines)
+
+        async def _finish(self, interaction: discord.Interaction) -> None:
+            cleanup_report = None
+            try:
+                if self.manager is not None:
+                    cleanup_report = self.manager.cleanup_session_cache(self.session_id)
+            except Exception:
+                cleanup_report = None
+            embed = discord.Embed(title="Inbox Review Complete", description=self._decision_summary_text(cleanup_report))
+            for child in self.children:
+                child.disabled = True
+            await interaction.edit_original_response(embed=embed, view=self, attachments=[])
+
+        async def _apply_review_action(self, interaction: discord.Interaction, action: str) -> None:
+            if not self._check_auth(interaction):
+                try:
+                    await interaction.response.send_message("This review session is not assigned to you.", ephemeral=True)
+                except Exception:
+                    pass
+                return
+            try:
+                await interaction.response.defer()
+            except Exception:
+                return
+            item = self._current_item()
+            if item is None:
+                await self._finish(interaction)
+                return
+            if action == "delete" and not self.allow_delete:
+                await interaction.edit_original_response(content="Delete is disabled for this review session.", view=self)
+                return
+            try:
+                result = self.manager.apply_decision(
+                    getattr(item, "note_path"),
+                    action,
+                    user=f"Discord:{getattr(getattr(interaction, 'user', None), 'id', 'unknown')}",
+                    allow_delete=self.allow_delete,
+                )
+            except Exception as exc:
+                await interaction.edit_original_response(content=f"Inbox Review action failed: {exc}", view=self)
+                return
+            self.decisions.append({"action": action, **(result if isinstance(result, dict) else {})})
+            try:
+                self.items = list(self.manager.discover_items(limit=100))
+            except Exception:
+                self.items.pop(self.index)
+            self.index = 0
+            if not self.items:
+                await self._finish(interaction)
+                return
+            embed, file_obj = self.build_current_payload(include_preview=True)
+            edit_kwargs = {"embed": embed, "view": self}
+            if file_obj:
+                edit_kwargs["attachments"] = [file_obj]
+            else:
+                edit_kwargs["attachments"] = []
+            await interaction.edit_original_response(**edit_kwargs)
+
+        @discord.ui.button(label="Item Details", style=discord.ButtonStyle.secondary, row=1)
+        async def item_details(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+            if not self._check_auth(interaction):
+                await interaction.response.send_message("This review session is not assigned to you.", ephemeral=True)
+                return
+            item = self._current_item()
+            if item is None:
+                await interaction.response.send_message("No current item.", ephemeral=True)
+                return
+            note = getattr(item, "note_path", "unknown")
+            await interaction.response.send_message(f"Current note: `{note}`", ephemeral=True)
+
+        @discord.ui.button(label="Stop Review", style=discord.ButtonStyle.danger, row=2)
+        async def stop_review(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+            if not self._check_auth(interaction):
+                await interaction.response.send_message("This review session is not assigned to you.", ephemeral=True)
+                return
+            try:
+                await interaction.response.defer()
+            except Exception:
+                return
+            await self._finish(interaction)
+else:
+    InboxReviewView = None
+
+
 def _abort_discord_websocket_transport(websocket: Any) -> bool:
     """Abort the active aiohttp transport after a bounded close times out."""
     socket = getattr(websocket, "socket", None)
@@ -7657,6 +7921,45 @@ class DiscordAdapter(BasePlatformAdapter):
                     raise Exception(f"HTTP {resp.status}")
                 return await resp.read()
 
+    async def _start_inbox_review(self, message: DiscordMessage) -> bool:
+        """Open the Discord-native Obsidian Inbox Review UI."""
+        try:
+            from gateway.inbox_review import InboxReviewManager
+        except Exception as exc:
+            await message.channel.send(
+                "Inbox Review manager is not available in the current checkout. "
+                f"Import failed: `{type(exc).__name__}: {exc}`"
+            )
+            return True
+        try:
+            manager = InboxReviewManager()
+            items = manager.discover_items(limit=100)
+        except Exception as exc:
+            await message.channel.send(f"Inbox Review queue probe failed: `{type(exc).__name__}: {exc}`")
+            return True
+        if not items:
+            await message.channel.send("Inbox Review: no unreviewed Inbox items found.")
+            return True
+        session_id = f"discord-{getattr(message.channel, 'id', 'unknown')}-{int(time.time())}"
+        view = InboxReviewView(
+            manager=manager,
+            items=items,
+            session_id=session_id,
+            allowed_user_ids={str(getattr(message.author, 'id', ''))},
+            allow_delete=True,
+        )
+        embed, file_obj = view.build_current_payload(include_preview=True)
+        content = (
+            f"Inbox Review started: {len(items)} item(s) queued. "
+            "Use the dropdown for the current item or `stop review` to stop."
+        )
+        kwargs = {"content": content, "embed": embed, "view": view}
+        if file_obj:
+            kwargs["file"] = file_obj
+        sent = await message.channel.send(**kwargs)
+        view.message = sent
+        return True
+
     async def _handle_message(
         self,
         message: DiscordMessage,
@@ -7708,6 +8011,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
                 normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
             message.content = normalized_content
+
+        if _is_inbox_review_stop_trigger(normalized_content):
+            try:
+                await message.channel.send("Inbox Review stopped. No vault action applied.")
+            except Exception:
+                logger.debug("[%s] Failed to send Inbox Review stop confirmation", self.name, exc_info=True)
+            return True
+        if _is_inbox_review_trigger(normalized_content):
+            return await self._start_inbox_review(message)
+
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
