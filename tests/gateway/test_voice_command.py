@@ -555,6 +555,7 @@ class TestVoiceChannelCommands:
         """Successful join sets voice_mode and returns confirmation."""
         mock_channel = MagicMock()
         mock_channel.name = "General"
+        mock_channel.id = int(os.environ.get("DISCORD_ALLOWED_VOICE_CHANNELS", "1536632245412958228").split(",")[0])
         mock_adapter = AsyncMock()
         mock_adapter.join_voice_channel = AsyncMock(return_value=True)
         mock_adapter.get_user_voice_channel = AsyncMock(return_value=mock_channel)
@@ -578,6 +579,7 @@ class TestVoiceChannelCommands:
         """Missing PyNaCl/davey should return a user-actionable install hint."""
         mock_channel = MagicMock()
         mock_channel.name = "General"
+        mock_channel.id = int(os.environ.get("DISCORD_ALLOWED_VOICE_CHANNELS", "1536632245412958228").split(",")[0])
         mock_adapter = AsyncMock()
         mock_adapter.join_voice_channel = AsyncMock(
             side_effect=RuntimeError("PyNaCl library needed in order to use voice")
@@ -950,6 +952,61 @@ class TestDiscordVoiceChannelMethods:
         adapter._maybe_auto_join_voice_channel.assert_awaited_once_with(member, channel)
 
     @pytest.mark.asyncio
+    async def test_auto_leave_uses_configured_auto_join_policy_after_channel_empties(self):
+        adapter = self._make_adapter()
+        guild = SimpleNamespace(id=111, name="Hermes Server")
+        channel = SimpleNamespace(id=456, name="apollo-voice", guild=guild, members=[])
+        adapter._voice_clients = {
+            111: SimpleNamespace(channel=SimpleNamespace(id=456))
+        }
+        adapter.is_in_voice_channel = MagicMock(return_value=True)
+        adapter.leave_voice_channel = AsyncMock(return_value=True)
+
+        def config_value(key, default=None, env_key=None):
+            values = {
+                "voice_auto_join": True,
+                "voice_auto_join_users": "42",
+                "voice_allowed_channel_names": "apollo-voice",
+            }
+            return values.get(key, default)
+
+        adapter._config_value = MagicMock(side_effect=config_value)
+        member = SimpleNamespace(id=42, display_name="Az", guild=guild)
+
+        result = await adapter._maybe_auto_leave_voice_channel(member, channel)
+
+        assert result is True
+        adapter.leave_voice_channel.assert_awaited_once_with(111)
+
+    @pytest.mark.asyncio
+    async def test_auto_leave_keeps_voice_connected_when_authorized_user_remains(self):
+        adapter = self._make_adapter()
+        guild = SimpleNamespace(id=111, name="Hermes Server")
+        remaining = SimpleNamespace(id=42, display_name="Az", bot=False, guild=guild)
+        channel = SimpleNamespace(id=456, name="apollo-voice", guild=guild, members=[remaining])
+        adapter._voice_clients = {
+            111: SimpleNamespace(channel=SimpleNamespace(id=456))
+        }
+        adapter.is_in_voice_channel = MagicMock(return_value=True)
+        adapter.leave_voice_channel = AsyncMock(return_value=True)
+        adapter._is_allowed_user = MagicMock(return_value=True)
+
+        def config_value(key, default=None, env_key=None):
+            values = {
+                "voice_auto_join": True,
+                "voice_auto_join_users": "42",
+                "voice_allowed_channel_names": "apollo-voice",
+            }
+            return values.get(key, default)
+
+        adapter._config_value = MagicMock(side_effect=config_value)
+
+        result = await adapter._maybe_auto_leave_voice_channel(remaining, channel)
+
+        assert result is False
+        adapter.leave_voice_channel.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_playback_timeout_scales_with_audio_duration(self):
         adapter = self._make_adapter()
         adapter._playback_timeout_seconds = 120
@@ -1081,6 +1138,7 @@ class TestCallbackWiringOrder:
 
         mock_channel = MagicMock()
         mock_channel.name = "General"
+        mock_channel.id = int(os.environ.get("DISCORD_ALLOWED_VOICE_CHANNELS", "1536632245412958228").split(",")[0])
         mock_adapter = AsyncMock()
         mock_adapter.join_voice_channel = AsyncMock(
             side_effect=RuntimeError("No permission")
