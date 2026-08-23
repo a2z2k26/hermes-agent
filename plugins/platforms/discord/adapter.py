@@ -4199,9 +4199,15 @@ class DiscordAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        """Send audio as a Discord file attachment."""
+        """Send audio as a Discord file attachment or play it in a bound VC."""
         try:
             import io
+
+            for gid, text_ch_id in getattr(self, "_voice_text_channels", {}).items():
+                if str(text_ch_id) == str(chat_id) and self.is_in_voice_channel(gid):
+                    logger.info("[%s] Playing outbound audio in voice channel (guild=%d)", self.name, gid)
+                    success = await self.play_in_voice_channel(gid, audio_path)
+                    return SendResult(success=bool(success))
 
             channel = self._client.get_channel(int(chat_id))
             if not channel:

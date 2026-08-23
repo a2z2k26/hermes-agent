@@ -343,6 +343,8 @@ class TestYamlBridgeSeeding:
         from agent import secret_scope
         from plugins.platforms.discord.adapter import _apply_yaml_config
 
+        monkeypatch.delenv("DISCORD_VOICE_AUTO_JOIN", raising=False)
+        monkeypatch.delenv("DISCORD_VOICE_AUTO_JOIN_USERS", raising=False)
         monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
         token = secret_scope.set_secret_scope({})
         try:

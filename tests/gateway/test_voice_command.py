@@ -826,6 +826,21 @@ class TestDiscordVoiceChannelMethods:
         assert result is mock_vc
 
 
+    @pytest.mark.asyncio
+    async def test_send_voice_plays_bound_text_chat_audio_in_voice_channel(self):
+        adapter = self._make_adapter()
+        adapter._voice_text_channels = {111: 123}
+        adapter.is_in_voice_channel = MagicMock(return_value=True)
+        adapter.play_in_voice_channel = AsyncMock(return_value=True)
+        adapter._client.get_channel = MagicMock()
+
+        result = await adapter.send_voice(chat_id="123", audio_path="/tmp/reply.mp3")
+
+        assert result.success is True
+        adapter.play_in_voice_channel.assert_awaited_once_with(111, "/tmp/reply.mp3")
+        adapter._client.get_channel.assert_not_called()
+
+
     def test_voice_timeout_zero_disables_auto_leave(self):
         adapter = self._make_adapter()
         adapter._voice_timeout_seconds = 0
