@@ -339,6 +339,32 @@ class TestYamlBridgeSeeding:
         assert os.getenv("DISCORD_ALLOWED_CHANNELS") is None
         assert os.getenv("DISCORD_ALLOWED_USERS") is None
 
+    def test_voice_auto_join_config_seeds_adapter_extra_without_env_leak(self, monkeypatch):
+        from agent import secret_scope
+        from plugins.platforms.discord.adapter import _apply_yaml_config
+
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+        token = secret_scope.set_secret_scope({})
+        try:
+            seeded = _apply_yaml_config(
+                {},
+                {
+                    "voice_auto_join": True,
+                    "voice_auto_join_users": "42",
+                    "voice_auto_join_text_channel_id": "123",
+                    "voice_allowed_channel_ids": "456",
+                },
+            )
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+        assert seeded["voice_auto_join"] is True
+        assert seeded["voice_auto_join_users"] == "42"
+        assert seeded["voice_auto_join_text_channel_id"] == "123"
+        assert seeded["voice_allowed_channel_ids"] == "456"
+        assert os.getenv("DISCORD_VOICE_AUTO_JOIN") is None
+        assert os.getenv("DISCORD_VOICE_AUTO_JOIN_USERS") is None
+
     def test_first_writer_env_does_not_mask_second_profile_extras(self, monkeypatch):
         """End-to-end shape of the original repro: profile A bridges env first;
         profile B (scoped load) still gets ITS channels via extras."""

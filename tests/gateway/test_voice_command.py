@@ -850,6 +850,105 @@ class TestDiscordVoiceChannelMethods:
         assert adapter._voice_timeout_seconds == 0
         assert adapter._playback_timeout_seconds == 240
 
+    def test_voice_auto_join_config_helpers_allow_configured_channel(self):
+        adapter = self._make_adapter()
+
+        def config_value(key, default=None, env_key=None):
+            values = {
+                "voice_auto_join": True,
+                "voice_auto_join_users": "42",
+                "voice_auto_join_text_channel_id": "123",
+                "voice_allowed_channel_names": "apollo-voice",
+            }
+            return values.get(key, default)
+
+        adapter._config_value = MagicMock(side_effect=config_value)
+        channel = SimpleNamespace(id=456, name="apollo-voice")
+
+        assert adapter._discord_voice_auto_join_enabled() is True
+        assert adapter._discord_voice_auto_join_users() == {"42"}
+        assert adapter._discord_voice_auto_join_text_channel_id(SimpleNamespace(id=111)) == 123
+        assert adapter._discord_voice_channel_allowed(channel) is True
+
+    @pytest.mark.asyncio
+    async def test_auto_join_authorized_user_links_voice_to_text_channel(self):
+        adapter = self._make_adapter()
+        adapter._voice_auto_join_attempts = {}
+        text_channel = SimpleNamespace(send=AsyncMock())
+        adapter._client.get_channel = MagicMock(return_value=text_channel)
+        adapter._is_allowed_user = MagicMock(return_value=True)
+        adapter.join_voice_channel = AsyncMock(return_value=True)
+        adapter._mark_voice_chat_enabled = MagicMock()
+
+        def config_value(key, default=None, env_key=None):
+            values = {
+                "voice_auto_join": True,
+                "voice_auto_join_users": "42",
+                "voice_auto_join_text_channel_id": "123",
+                "voice_allowed_channel_names": "apollo-voice",
+            }
+            return values.get(key, default)
+
+        adapter._config_value = MagicMock(side_effect=config_value)
+        guild = SimpleNamespace(id=111, name="Hermes Server")
+        channel = SimpleNamespace(id=456, name="apollo-voice", guild=guild)
+        member = SimpleNamespace(id=42, display_name="Az", guild=guild)
+
+        result = await adapter._maybe_auto_join_voice_channel(member, channel)
+
+        assert result is True
+        adapter.join_voice_channel.assert_awaited_once()
+        _, kwargs = adapter.join_voice_channel.await_args
+        assert kwargs["text_channel_id"] == 123
+        assert kwargs["source"]["chat_id"] == "123"
+        assert kwargs["source"]["user_id"] == "42"
+        adapter._mark_voice_chat_enabled.assert_called_once_with("123")
+        text_channel.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_auto_join_ignores_unconfigured_channel(self):
+        adapter = self._make_adapter()
+        adapter._voice_auto_join_attempts = {}
+        adapter._client.get_channel = MagicMock()
+        adapter._is_allowed_user = MagicMock(return_value=True)
+        adapter.join_voice_channel = AsyncMock(return_value=True)
+
+        def config_value(key, default=None, env_key=None):
+            values = {
+                "voice_auto_join": True,
+                "voice_auto_join_users": "42",
+                "voice_auto_join_text_channel_id": "123",
+                "voice_allowed_channel_names": "apollo-voice",
+            }
+            return values.get(key, default)
+
+        adapter._config_value = MagicMock(side_effect=config_value)
+        guild = SimpleNamespace(id=111, name="Hermes Server")
+        channel = SimpleNamespace(id=789, name="other-voice", guild=guild)
+        member = SimpleNamespace(id=42, display_name="Az", guild=guild)
+
+        result = await adapter._maybe_auto_join_voice_channel(member, channel)
+
+        assert result is False
+        adapter.join_voice_channel.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_auto_join_current_voice_members_scans_configured_channel_after_restart(self):
+        adapter = self._make_adapter()
+        guild = SimpleNamespace(id=111, name="Hermes Server")
+        member = SimpleNamespace(id=42, display_name="Az", bot=False, guild=guild)
+        channel = SimpleNamespace(id=456, name="apollo-voice", guild=guild, members=[member])
+        guild.voice_channels = [channel]
+        adapter._client.guilds = [guild]
+        adapter._client.user = SimpleNamespace(id=999)
+        adapter._discord_voice_auto_join_enabled = MagicMock(return_value=True)
+        adapter._discord_voice_channel_allowed = MagicMock(return_value=True)
+        adapter._maybe_auto_join_voice_channel = AsyncMock(return_value=True)
+
+        await adapter._auto_join_current_voice_members()
+
+        adapter._maybe_auto_join_voice_channel.assert_awaited_once_with(member, channel)
+
     @pytest.mark.asyncio
     async def test_playback_timeout_scales_with_audio_duration(self):
         adapter = self._make_adapter()
