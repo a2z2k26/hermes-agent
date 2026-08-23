@@ -4496,6 +4496,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     f"Joined voice channel **{getattr(channel, 'name', 'voice')}**. "
                     "I'll speak my replies and listen. Use /voice leave to disconnect."
                 )
+        await self._speak_auto_voice_greeting(int(guild_id))
         return True
 
     def _discord_voice_auto_join_enabled(self) -> bool:
@@ -4852,7 +4853,11 @@ class DiscordAdapter(BasePlatformAdapter):
         }
 
     async def _speak_auto_voice_greeting(self, guild_id: int) -> bool:
-        greeting = os.environ.get("DISCORD_VOICE_JOIN_GREETING", "").strip()
+        greeting = str(self._config_value(
+            "voice_join_greeting_text",
+            "",
+            env_key="DISCORD_VOICE_JOIN_GREETING",
+        )).strip()
         if not greeting:
             return False
         audio_path = os.path.join(
@@ -4919,9 +4924,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 remaining_allowed_users.append(maybe_member)
         if remaining_allowed_users:
             return False
-        logger.info("Voice auto-leave: no allowed users remain in channel=%s guild=%s", getattr(channel, "id", None), guild_id)
-        await self.leave_voice_channel(guild_id)
-        return True
+        logger.info("Voice auto-leave deferred to inactivity timeout: no allowed users remain in channel=%s guild=%s", getattr(channel, "id", None), guild_id)
+        self._reset_voice_timeout(guild_id)
+        return False
 
     async def join_voice_channel(self, channel, *, text_channel_id: int = None, source: dict = None) -> bool:
         """Join a Discord voice channel. Returns True on success.
@@ -10929,6 +10934,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         ("voice_allowed_channel_names", "DISCORD_VOICE_ALLOWED_CHANNEL_NAMES"),
         ("voice_denied_channel_ids", "DISCORD_VOICE_DENIED_CHANNEL_IDS"),
         ("voice_denied_channel_names", "DISCORD_VOICE_DENIED_CHANNEL_NAMES"),
+        ("voice_join_greeting_text", "DISCORD_VOICE_JOIN_GREETING"),
     )
     for key, env_key in _voice_auto_join_keys:
         value = _websocket_liveness_cfg.get(key)

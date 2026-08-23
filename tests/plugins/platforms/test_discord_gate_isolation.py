@@ -355,6 +355,7 @@ class TestYamlBridgeSeeding:
                     "voice_auto_join_users": "42",
                     "voice_auto_join_text_channel_id": "123",
                     "voice_allowed_channel_ids": "456",
+                    "voice_join_greeting_text": "Apollo online. I'm listening.",
                 },
             )
         finally:
@@ -364,6 +365,7 @@ class TestYamlBridgeSeeding:
         assert seeded["voice_auto_join_users"] == "42"
         assert seeded["voice_auto_join_text_channel_id"] == "123"
         assert seeded["voice_allowed_channel_ids"] == "456"
+        assert seeded["voice_join_greeting_text"] == "Apollo online. I'm listening."
         assert os.getenv("DISCORD_VOICE_AUTO_JOIN") is None
         assert os.getenv("DISCORD_VOICE_AUTO_JOIN_USERS") is None
 

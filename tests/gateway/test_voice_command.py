@@ -896,6 +896,7 @@ class TestDiscordVoiceChannelMethods:
         adapter._is_allowed_user = MagicMock(return_value=True)
         adapter.join_voice_channel = AsyncMock(return_value=True)
         adapter._mark_voice_chat_enabled = MagicMock()
+        adapter._speak_auto_voice_greeting = AsyncMock(return_value=True)
 
         def config_value(key, default=None, env_key=None):
             values = {
@@ -920,6 +921,7 @@ class TestDiscordVoiceChannelMethods:
         assert kwargs["source"]["chat_id"] == "123"
         assert kwargs["source"]["user_id"] == "42"
         adapter._mark_voice_chat_enabled.assert_called_once_with("123")
+        adapter._speak_auto_voice_greeting.assert_awaited_once_with(111)
         text_channel.send.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -967,7 +969,7 @@ class TestDiscordVoiceChannelMethods:
         adapter._maybe_auto_join_voice_channel.assert_awaited_once_with(member, channel)
 
     @pytest.mark.asyncio
-    async def test_auto_leave_uses_configured_auto_join_policy_after_channel_empties(self):
+    async def test_auto_leave_defers_disconnect_to_inactivity_timeout_after_channel_empties(self):
         adapter = self._make_adapter()
         guild = SimpleNamespace(id=111, name="Hermes Server")
         channel = SimpleNamespace(id=456, name="apollo-voice", guild=guild, members=[])
@@ -976,6 +978,7 @@ class TestDiscordVoiceChannelMethods:
         }
         adapter.is_in_voice_channel = MagicMock(return_value=True)
         adapter.leave_voice_channel = AsyncMock(return_value=True)
+        adapter._reset_voice_timeout = MagicMock()
 
         def config_value(key, default=None, env_key=None):
             values = {
@@ -990,8 +993,9 @@ class TestDiscordVoiceChannelMethods:
 
         result = await adapter._maybe_auto_leave_voice_channel(member, channel)
 
-        assert result is True
-        adapter.leave_voice_channel.assert_awaited_once_with(111)
+        assert result is False
+        adapter.leave_voice_channel.assert_not_awaited()
+        adapter._reset_voice_timeout.assert_called_once_with(111)
 
     @pytest.mark.asyncio
     async def test_auto_leave_keeps_voice_connected_when_authorized_user_remains(self):
