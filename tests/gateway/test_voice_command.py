@@ -14,8 +14,25 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 
 def _ensure_discord_mock():
-    """Install a lightweight discord mock when discord.py isn't available."""
-    if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
+    """Install a lightweight discord mock only when discord.py isn't available.
+
+    The integration voice tests need the real discord.opus.Decoder.  When this
+    unit-test module is imported first, an unconditional mock poisons
+    sys.modules["discord"] for the rest of the pytest process, so prefer the
+    real package whenever it is installed.
+    """
+    existing = sys.modules.get("discord")
+    if existing is not None and hasattr(existing, "__file__"):
+        return
+    if existing is not None and not hasattr(existing, "__file__"):
+        for name in ("discord.ext.commands", "discord.ext", "discord"):
+            sys.modules.pop(name, None)
+    try:
+        has_real_discord = importlib.util.find_spec("discord") is not None
+    except (ImportError, ValueError):
+        has_real_discord = False
+    if has_real_discord:
+        __import__("discord")
         return
 
     discord_mod = MagicMock()
@@ -921,6 +938,114 @@ class TestDiscordVoiceChannelMethods:
 
 
         # Should not raise
+
+
+# =====================================================================
+# Discord fleet voice protocol (auto-join, namesake greeting, council mode)
+# =====================================================================
+
+class TestDiscordFleetVoiceProtocol:
+    """Regression tests for Achilles/fleet Discord live voice behavior."""
+
+    @pytest.fixture
+    def runner(self, tmp_path, monkeypatch):
+        runner = _make_runner(tmp_path)
+        cfg = {
+            "discord": {
+                "voice_agent_name": "Achilles",
+                "voice_agent_aliases": ["Achilles", "I kill you"],
+                "voice_namesake_channel_ids": ["1534095360895750144"],
+                "voice_namesake_channel_names": ["achilles-voice"],
+                "voice_namesake_greeting": "Hello, Achilles here. How can I help?",
+                "voice_bredren_council_mode": True,
+                "voice_bredren_council_channel_ids": ["1476645830898483346"],
+                "voice_bredren_council_channel_names": ["bredren-voice"],
+            }
+        }
+        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: cfg)
+        return runner
+
+    @staticmethod
+    def _channel(channel_id, name):
+        return SimpleNamespace(id=channel_id, name=name, guild=SimpleNamespace(name="Council", id=111))
+
+    def test_channel_policy_and_exact_greeting(self, runner):
+        namesake = self._channel(1534095360895750144, "achilles-voice")
+        bredren = self._channel(1476645830898483346, "bredren-voice")
+
+        assert runner._discord_voice_is_namesake_channel(namesake) is True
+        assert runner._discord_voice_is_namesake_channel(bredren) is False
+        assert runner._discord_voice_is_bredren_council_channel(bredren) is True
+        assert runner._discord_voice_namesake_greeting() == "Hello, Achilles here. How can I help?"
+
+    @pytest.mark.parametrize(
+        "transcript",
+        [
+            "Achilles, say hi.",
+            "I kill you. Say hi.",  # common tiny.en STT rendering for Achilles
+            "Everyone say hi.",
+            "All of you respond briefly.",
+            "Agents, speak one at a time.",
+            "You have the floor.",
+            "Let's do a council discussion.",
+        ],
+    )
+    def test_bredren_council_allows_direct_or_round_invites(self, runner, transcript):
+        assert runner._discord_voice_council_allows_response(transcript) is True
+
+    @pytest.mark.parametrize(
+        "transcript",
+        [
+            "Good afternoon, Marcion.",
+            "Bamba, say hi.",
+            "This is just background chatter.",
+            "[BLANK_AUDIO]",
+        ],
+    )
+    def test_bredren_council_suppresses_unaddressed_chatter(self, runner, transcript):
+        assert runner._discord_voice_council_allows_response(transcript) is False
+
+    def test_auto_join_greets_only_namesake_channel(self, runner):
+        import asyncio
+        from gateway.config import Platform
+
+        namesake = self._channel(1534095360895750144, "achilles-voice")
+        bredren = self._channel(1476645830898483346, "bredren-voice")
+        adapter = AsyncMock()
+        adapter.join_voice_channel = AsyncMock(return_value=True)
+        adapter._voice_text_channels = {}
+        adapter._voice_sources = {}
+        adapter._auto_tts_enabled_chats = set()
+        adapter._auto_tts_disabled_chats = set()
+        runner.adapters[Platform.DISCORD] = adapter
+        runner._send_voice_reply = AsyncMock()
+
+        asyncio.run(runner._handle_voice_auto_join(111, 1003486059386130463, namesake))
+        runner._send_voice_reply.assert_awaited_once()
+        assert runner._send_voice_reply.await_args.args[1] == "Hello, Achilles here. How can I help?"
+
+        runner._send_voice_reply.reset_mock()
+        asyncio.run(runner._handle_voice_auto_join(111, 1003486059386130463, bredren))
+        runner._send_voice_reply.assert_not_awaited()
+
+    def test_bredren_council_gate_prevents_unaddressed_pipeline(self, runner):
+        import asyncio
+        from gateway.config import Platform
+
+        bredren = self._channel(1476645830898483346, "bredren-voice")
+        adapter = SimpleNamespace(
+            _voice_text_channels={111: 1476645830898483346},
+            _voice_sources={},
+            _client=SimpleNamespace(get_channel=MagicMock(return_value=bredren)),
+            handle_message=AsyncMock(),
+        )
+        runner.adapters[Platform.DISCORD] = adapter
+
+        asyncio.run(runner._handle_voice_channel_input(111, 1003486059386130463, "Bamba, say hi."))
+        adapter.handle_message.assert_not_awaited()
+
+        asyncio.run(runner._handle_voice_channel_input(111, 1003486059386130463, "Everyone say hi."))
+        adapter.handle_message.assert_awaited_once()
 
 
 # =====================================================================

@@ -6569,6 +6569,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _auto_tts_default = False
         if hasattr(adapter, "_auto_tts_default"):
             adapter._auto_tts_default = _auto_tts_default
+        if platform == Platform.DISCORD:
+            if hasattr(adapter, "_voice_input_callback"):
+                adapter._voice_input_callback = self._handle_voice_channel_input
+            if hasattr(adapter, "_voice_auto_join_callback"):
+                adapter._voice_auto_join_callback = self._handle_voice_auto_join
+            if hasattr(adapter, "_on_voice_disconnect"):
+                adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
+            if hasattr(adapter, "_voice_mode_getter"):
+                adapter._voice_mode_getter = lambda chat_id: self._voice_mode.get(
+                    self._voice_key(Platform.DISCORD, str(chat_id)), "off"
+                )
 
         prefix = f"{platform.value}:"
         if isinstance(disabled_chats, set):
@@ -19633,6 +19644,154 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return None
 
 
+    def _discord_voice_config_value(self, key: str, default: Any = None) -> Any:
+        """Read discord.<key> from config.yaml for fleet voice policy."""
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            discord_cfg = cfg.get("discord", {}) or {}
+            return discord_cfg.get(key, default)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _split_config_values(value: Any) -> set[str]:
+        """Normalize comma/list config values into stripped strings."""
+        if value is None:
+            return set()
+        if isinstance(value, (list, tuple, set)):
+            return {str(v).strip() for v in value if str(v).strip()}
+        return {v.strip() for v in str(value).split(",") if v.strip()}
+
+    def _discord_voice_agent_name(self) -> str:
+        return str(self._discord_voice_config_value("voice_agent_name", "Achilles") or "Achilles")
+
+    def _discord_voice_channel_matches(self, channel, id_key: str, name_key: str) -> bool:
+        keys = {
+            str(getattr(channel, "id", "")),
+            str(getattr(channel, "name", "")).strip(),
+            f"#{str(getattr(channel, 'name', '')).strip()}",
+        }
+        keys.discard("")
+        ids = self._split_config_values(self._discord_voice_config_value(id_key))
+        names = self._split_config_values(self._discord_voice_config_value(name_key))
+        return bool(keys & (ids | names))
+
+    def _discord_voice_is_namesake_channel(self, channel) -> bool:
+        return self._discord_voice_channel_matches(
+            channel,
+            "voice_namesake_channel_ids",
+            "voice_namesake_channel_names",
+        )
+
+    def _discord_voice_is_bredren_council_channel(self, channel) -> bool:
+        return self._discord_voice_channel_matches(
+            channel,
+            "voice_bredren_council_channel_ids",
+            "voice_bredren_council_channel_names",
+        )
+
+    def _discord_voice_namesake_greeting(self) -> str:
+        agent_name = self._discord_voice_agent_name()
+        default = f"Hello, {agent_name} here. How can I help?"
+        return str(self._discord_voice_config_value("voice_namesake_greeting", default) or default)
+
+    def _discord_voice_council_mode_enabled(self) -> bool:
+        raw = self._discord_voice_config_value("voice_bredren_council_mode", True)
+        if isinstance(raw, bool):
+            return raw
+        return str(raw or "").strip().lower() in {"true", "1", "yes", "on"}
+
+    def _discord_voice_council_allows_response(self, transcript: str) -> bool:
+        """Bredren council gate: respond only when addressed or given the floor."""
+        text = re.sub(r"\s+", " ", transcript or "").strip().lower()
+        if not text:
+            return False
+        aliases = self._split_config_values(self._discord_voice_config_value("voice_agent_aliases"))
+        aliases.add(self._discord_voice_agent_name())
+        for alias in aliases:
+            alias_norm = re.sub(r"\s+", " ", str(alias).strip().lower())
+            if not alias_norm:
+                continue
+            alias_re = re.escape(alias_norm).replace(r"\ ", r"\s+")
+            if re.search(rf"(^|\b)@?{alias_re}(\b|[,.:;!?])", text):
+                return True
+        invite_patterns = (
+            r"\beveryone (answer|speak|talk|respond|reply|say)\b",
+            r"\ball (of you )?(answer|speak|talk|respond|reply|say)\b",
+            r"\bagents[, ]+(answer|speak|talk|respond|reply|say)\b",
+            r"\byou have the floor\b",
+            r"\bgroup (round|discussion|response|answer)\b",
+            r"\bcouncil (round|discussion|response|answer)\b",
+        )
+        return any(re.search(pattern, text) for pattern in invite_patterns)
+
+    async def _handle_voice_auto_join(self, guild_id: int, user_id: int, channel) -> None:
+        """Auto-join Discord voice when an allowed user enters a permitted channel."""
+        from types import SimpleNamespace
+
+        adapter = self.adapters.get(Platform.DISCORD)
+        if not adapter or not hasattr(adapter, "join_voice_channel"):
+            return
+        chat_id = str(getattr(channel, "id", guild_id))
+        guild = getattr(channel, "guild", None)
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id=chat_id,
+            chat_name=(
+                f"{getattr(guild, 'name', 'Discord')} / #{getattr(channel, 'name', chat_id)}"
+                if guild is not None else str(getattr(channel, "name", chat_id))
+            ),
+            chat_type="group",
+            user_id=str(user_id),
+            user_name=str(user_id),
+        )
+        if not self._is_user_authorized(source):
+            logger.debug("Unauthorized Discord voice auto-join user %s", user_id)
+            return
+        if hasattr(adapter, "_voice_input_callback"):
+            adapter._voice_input_callback = self._handle_voice_channel_input
+        if hasattr(adapter, "_on_voice_disconnect"):
+            adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
+        if hasattr(adapter, "_voice_mode_getter"):
+            adapter._voice_mode_getter = lambda bound_chat_id: self._voice_mode.get(
+                self._voice_key(Platform.DISCORD, str(bound_chat_id)), "off"
+            )
+        logger.info(
+            "Discord voice auto-join requested: guild=%s user=%s channel=%s (%s)",
+            guild_id,
+            user_id,
+            getattr(channel, "id", "?"),
+            getattr(channel, "name", "?"),
+        )
+        success = await adapter.join_voice_channel(channel)
+        if not success:
+            return
+        adapter._voice_text_channels[guild_id] = int(chat_id)
+        if hasattr(adapter, "_voice_sources"):
+            adapter._voice_sources[guild_id] = source.to_dict()
+        self._voice_mode[self._voice_key(Platform.DISCORD, chat_id)] = "all"
+        self._save_voice_modes()
+        self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True)
+        if self._discord_voice_is_namesake_channel(channel):
+            await self._send_voice_reply(
+                MessageEvent(
+                    source=source,
+                    text="",
+                    message_type=MessageType.COMMAND,
+                    raw_message=SimpleNamespace(guild_id=guild_id, guild=guild),
+                ),
+                self._discord_voice_namesake_greeting(),
+            )
+        else:
+            logger.info(
+                "Discord voice auto-join greeting suppressed outside namesake channel: guild=%s channel=%s (%s)",
+                guild_id,
+                getattr(channel, "id", "?"),
+                getattr(channel, "name", "?"),
+            )
+
+
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
         """Join the user's current Discord voice channel."""
         adapter = self._adapter_for_source(event.source)
@@ -19682,6 +19841,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "all"
             self._save_voice_modes()
             self._set_adapter_auto_tts_enabled(adapter, event.source.chat_id, enabled=True)
+            try:
+                if self._discord_voice_is_namesake_channel(voice_channel):
+                    await self._send_voice_reply(event, self._discord_voice_namesake_greeting())
+                else:
+                    logger.info(
+                        "Voice join confirmation suppressed outside namesake channel: guild=%s channel=%s (%s)",
+                        guild_id,
+                        getattr(voice_channel, "id", "?"),
+                        getattr(voice_channel, "name", "?"),
+                    )
+            except Exception as exc:
+                logger.warning("Voice join confirmation playback failed: %s", exc, exc_info=True)
             return (
                 f"Joined voice channel **{voice_channel.name}**.\n"
                 f"I'll speak my replies and listen to you. Use /voice leave to disconnect."
@@ -19816,6 +19987,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if channel:
                 safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
                 await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
+        except Exception:
+            pass
+
+        try:
+            voice_channel = adapter._client.get_channel(text_ch_id) if getattr(adapter, "_client", None) else None
+            if (
+                voice_channel is not None
+                and self._discord_voice_council_mode_enabled()
+                and self._discord_voice_is_bredren_council_channel(voice_channel)
+                and not self._discord_voice_council_allows_response(transcript)
+            ):
+                logger.info(
+                    "Bredren council mode suppressed unaddressed voice input: guild=%s channel=%s user=%s transcript=%s",
+                    guild_id,
+                    getattr(voice_channel, "name", text_ch_id),
+                    user_id,
+                    transcript[:200],
+                )
+                return
         except Exception:
             pass
 

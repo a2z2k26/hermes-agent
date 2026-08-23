@@ -186,8 +186,26 @@ def _ensure_discord_mock() -> None:
     this function (it short-circuits when already present) rather than
     maintaining their own mock setup.
     """
-    if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
+    existing = sys.modules.get("discord")
+    if existing is not None and hasattr(existing, "__file__"):
         return  # Real library is installed — nothing to mock
+
+    # Prefer the real discord.py package when it is installed, even if an
+    # earlier-imported test module already inserted a lightweight mock into
+    # sys.modules. Voice integration tests need real discord.opus.Decoder and
+    # discord.utils; a stale mock silently poisons packet buffering coverage.
+    try:
+        import importlib
+
+        for name in ("discord.ext.commands", "discord.ext", "discord"):
+            mod = sys.modules.get(name)
+            if mod is not None and not hasattr(mod, "__file__"):
+                sys.modules.pop(name, None)
+        importlib.import_module("discord")
+        importlib.import_module("discord.ext.commands")
+        return
+    except ImportError:
+        pass
 
     from types import SimpleNamespace
 
