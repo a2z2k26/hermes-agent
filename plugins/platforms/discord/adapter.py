@@ -4559,6 +4559,13 @@ class DiscordAdapter(BasePlatformAdapter):
         (``_voice_text_channels``) without requiring `/voice join`.
         This supports automatic/programmatic voice joins where the
         command flow that normally establishes the binding is absent.
+
+        ``source`` is stored in ``_voice_sources`` and later rebuilt with
+        ``SessionSource.from_dict()``, which requires ``platform`` and
+        ``chat_id``. Callers may pass a partial dict: missing keys are filled
+        from ``text_channel_id`` / ``voice_default_text_channel_id`` before it
+        is stored, so a programmatic join cannot silently produce a source that
+        voice input is unable to route.
         """
         if not self._client or not DISCORD_AVAILABLE:
             return False
@@ -4584,7 +4591,30 @@ class DiscordAdapter(BasePlatformAdapter):
             if text_channel_id is not None:
                 self._voice_text_channels[guild_id] = text_channel_id
             if source is not None:
-                self._voice_sources[guild_id] = source
+                # ``_voice_sources`` is consumed by
+                # ``GatewayRunner._handle_voice_channel_input`` via
+                # ``SessionSource.from_dict()``, which requires ``platform`` and
+                # ``chat_id``. The ``/voice join`` command path stores
+                # ``event.source.to_dict()`` and satisfies that, but the
+                # auto-join path passes a marker dict, so every transcript
+                # raised ``KeyError: 'platform'`` inside the listen loop and was
+                # swallowed as a warning -- speech transcribed, then discarded.
+                # Normalise here so both writers store the same shape.
+                normalised = dict(source)
+                normalised.setdefault("platform", "discord")
+                if not normalised.get("chat_id"):
+                    bound = text_channel_id or self._voice_default_text_channel_id()
+                    if bound:
+                        normalised["chat_id"] = str(bound)
+                normalised.setdefault("chat_type", "channel")
+                if not normalised.get("chat_id"):
+                    logger.warning(
+                        "[%s] Voice source for guild %s has no text channel to bind to; "
+                        "voice replies have nowhere to go. Set discord.voice_default_text_channel_id.",
+                        self.name, guild_id,
+                    )
+                else:
+                    self._voice_sources[guild_id] = normalised
 
             # Start voice receiver (Phase 2: listen to users)
             try:

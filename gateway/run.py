@@ -22179,7 +22179,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # so voice input shares the same session as the bound text conversation.
         source_data = getattr(adapter, "_voice_sources", {}).get(guild_id)
         if source_data:
-            source = SessionSource.from_dict(source_data)
+            # A malformed source raised a bare KeyError inside the voice listen
+            # loop, where it was swallowed as "Voice input processing failed:
+            # 'platform'" -- speech was transcribed and then discarded with no
+            # usable diagnosis. Name the problem instead.
+            try:
+                source = SessionSource.from_dict(source_data)
+            except (KeyError, ValueError, TypeError) as exc:
+                logger.error(
+                    "Voice source for guild %s is malformed (%s: %s); keys=%s. "
+                    "Voice input cannot be routed to a session.",
+                    guild_id, type(exc).__name__, exc, sorted(source_data),
+                )
+                return
             source.user_id = str(user_id)
             source.user_name = str(user_id)
         else:
