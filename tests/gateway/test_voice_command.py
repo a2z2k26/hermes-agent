@@ -1025,6 +1025,24 @@ class TestDiscordVoiceChannelMethods:
         assert result is False
         adapter.leave_voice_channel.assert_not_awaited()
 
+    def test_voice_join_greeting_silent_channels_default_empty(self):
+        """No config -> empty silent-channels set (upstream greet-everywhere behavior)."""
+        adapter = self._make_adapter()
+        adapter._config_value = MagicMock(return_value=None)
+        assert adapter._discord_voice_join_greeting_silent_channels() == set()
+
+    def test_voice_join_greeting_silent_channels_parses_list(self):
+        """List config -> lowercased set of channel names to keep silent."""
+        adapter = self._make_adapter()
+        adapter._config_value = MagicMock(return_value=["bredren-voice", "council"])
+        assert adapter._discord_voice_join_greeting_silent_channels() == {"bredren-voice", "council"}
+
+    def test_voice_join_greeting_silent_channels_parses_comma_string(self):
+        """Comma-separated string config -> same normalised set."""
+        adapter = self._make_adapter()
+        adapter._config_value = MagicMock(return_value="Bredren-Voice, Council ")
+        assert adapter._discord_voice_join_greeting_silent_channels() == {"bredren-voice", "council"}
+
     @pytest.mark.asyncio
     async def test_playback_timeout_scales_with_audio_duration(self):
         adapter = self._make_adapter()

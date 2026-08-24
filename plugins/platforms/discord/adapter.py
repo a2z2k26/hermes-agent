@@ -4496,7 +4496,18 @@ class DiscordAdapter(BasePlatformAdapter):
                     f"Joined voice channel **{getattr(channel, 'name', 'voice')}**. "
                     "I'll speak my replies and listen. Use /voice leave to disconnect."
                 )
-        await self._speak_auto_voice_greeting(int(guild_id))
+        # Shared voice rooms (e.g. bredren-voice) should remain silent on join
+        # even when a greeting is configured. Marcion should not step on other
+        # agents' turns in council-style rooms. Gate the greeting on a
+        # per-channel silent-list before invoking upstream's speaker.
+        channel_name = str(getattr(channel, "name", "") or "").strip().lower()
+        if channel_name in self._discord_voice_join_greeting_silent_channels():
+            logger.info(
+                "Voice greeting suppressed: channel=%s is in voice_join_greeting_silent_channels",
+                channel_name,
+            )
+        else:
+            await self._speak_auto_voice_greeting(int(guild_id))
         return True
 
     def _discord_voice_auto_join_enabled(self) -> bool:
@@ -4851,6 +4862,26 @@ class DiscordAdapter(BasePlatformAdapter):
             "scope_id": guild_id,
             "guild_id": guild_id,
         }
+
+    def _discord_voice_join_greeting_silent_channels(self) -> set[str]:
+        """Voice channels where the auto-join greeting must NOT fire.
+
+        Preserves marcion's per-channel silent-on-join intent (see
+        marcion-harness runbook: greeting only in namesake channel; stay
+        silent in shared rooms like bredren-voice). Config accepts a list,
+        tuple, set, or comma-separated string of channel names. Names are
+        normalised to lowercase for comparison. Missing / empty config
+        means "no channels are silent" (upstream behaviour: greet on every
+        auto-join).
+        """
+        raw = self._config_value("voice_join_greeting_silent_channels", None)
+        if raw is None:
+            return set()
+        if isinstance(raw, (list, tuple, set)):
+            items = raw
+        else:
+            items = str(raw).split(",")
+        return {str(item).strip().lower() for item in items if str(item).strip()}
 
     async def _speak_auto_voice_greeting(self, guild_id: int) -> bool:
         greeting = str(self._config_value(
@@ -10935,6 +10966,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         ("voice_denied_channel_ids", "DISCORD_VOICE_DENIED_CHANNEL_IDS"),
         ("voice_denied_channel_names", "DISCORD_VOICE_DENIED_CHANNEL_NAMES"),
         ("voice_join_greeting_text", "DISCORD_VOICE_JOIN_GREETING"),
+        ("voice_join_greeting_silent_channels", None),
     )
     for key, env_key in _voice_auto_join_keys:
         value = _websocket_liveness_cfg.get(key)
