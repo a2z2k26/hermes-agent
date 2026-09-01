@@ -4603,11 +4603,17 @@ class DiscordAdapter(BasePlatformAdapter):
         return True
 
     def _mark_voice_chat_enabled(self, chat_id: str) -> None:
-        """Mirror /voice channel state after an automatic voice join."""
+        """Mirror voice-channel state after an automatic voice join.
+
+        Auto-join should make voice-channel input speak back in the VC, but it
+        must not turn the bound text chat into an audio/TTS channel. Persist
+        ``voice_only`` rather than ``all`` so typed Discord/DM messages remain
+        text-only while transcribed VC turns still get spoken replies.
+        """
         runner = getattr(self, "gateway_runner", None)
         if runner is not None:
             try:
-                runner._voice_mode[runner._voice_key(Platform.DISCORD, str(chat_id))] = "all"
+                runner._voice_mode[runner._voice_key(Platform.DISCORD, str(chat_id))] = "voice_only"
                 runner._save_voice_modes()
                 runner._set_adapter_auto_tts_enabled(self, str(chat_id), enabled=True)
             except Exception:
