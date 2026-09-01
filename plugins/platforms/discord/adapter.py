@@ -11023,6 +11023,12 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         ("voice_denied_channel_names", "DISCORD_VOICE_DENIED_CHANNEL_NAMES"),
         ("voice_join_greeting_text", "DISCORD_VOICE_JOIN_GREETING"),
         ("voice_join_greeting_silent_channels", None),
+        # B6 root-cause fix (2026-09-01): these two were consumed by the
+        # adapter via _config_value but never bridged into extra — the
+        # empty-channel timer silently resolved None (config.yaml fallback
+        # added 08-31 stays as belt-and-suspenders).
+        ("voice_empty_channel_timeout_seconds", None),
+        ("voice_channel_inactivity_timeout_seconds", None),
     )
     for key, env_key in _voice_auto_join_keys:
         value = _websocket_liveness_cfg.get(key)
