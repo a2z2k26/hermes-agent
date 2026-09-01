@@ -5271,7 +5271,11 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def leave_voice_channel(self, guild_id: int) -> None:
         """Disconnect from the voice channel in a guild."""
-        self._clear_voice_binding(int(guild_id))
+        # Bumba's shutdown guard: a gateway-shutdown leave must NOT drop the
+        # persisted binding — it is exactly what the on-ready reconcile needs
+        # to restore voice after the restart. Only user-driven leaves clear.
+        if not getattr(self, "_disconnecting", False):
+            self._clear_voice_binding(int(guild_id))
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
             # Stop voice receiver first
             receiver = self._voice_receivers.pop(guild_id, None)
