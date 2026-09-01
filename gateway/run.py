@@ -7529,6 +7529,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             enabled_chats.discard(chat_id)
 
+    def _wire_voice_channel_callbacks(self, adapter) -> None:
+        """Wire voice callbacks before manual or automatic Discord voice joins."""
+        if hasattr(adapter, "_voice_input_callback"):
+            adapter._voice_input_callback = self._handle_voice_channel_input
+        if hasattr(adapter, "_on_voice_disconnect"):
+            adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
+        if hasattr(adapter, "_voice_mode_getter"):
+            adapter._voice_mode_getter = lambda chat_id: self._voice_mode.get(
+                self._voice_key(Platform.DISCORD, str(chat_id)), "off"
+            )
+        if hasattr(adapter, "_on_voice_auto_join"):
+            adapter._on_voice_auto_join = self._handle_voice_auto_join_state
+
+    def _handle_voice_auto_join_state(self, chat_id: str) -> None:
+        """Mirror manual /voice channel state for Discord auto-joined channels."""
+        self._voice_mode[self._voice_key(Platform.DISCORD, str(chat_id))] = "all"
+        self._save_voice_modes()
+        adapter = self.adapters.get(Platform.DISCORD)
+        self._set_adapter_auto_tts_enabled(adapter, str(chat_id), enabled=True)
+
     def _sync_voice_mode_state_to_adapter(self, adapter) -> None:
         """Restore persisted /voice state into a live platform adapter.
 
@@ -12958,6 +12978,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
             adapter.set_platform_event_handler(self._primary_platform_event_handler())
             adapter._busy_text_mode = self._busy_text_mode
+            self._wire_voice_channel_callbacks(adapter)
             _pending_connects.append((platform, platform_config, adapter))
 
         if await self._abort_startup_if_shutdown_requested():
@@ -14575,6 +14596,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
                     adapter.set_platform_event_handler(self._primary_platform_event_handler())
                     adapter._busy_text_mode = self._busy_text_mode
+                    self._wire_voice_channel_callbacks(adapter)
 
                     # Reconnect after an outage: preserve the platform's
                     # server-side update queue so messages sent while the bot
@@ -15667,6 +15689,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if isinstance(text_modes, dict)
             else self._busy_text_mode
         )
+        self._wire_voice_channel_callbacks(adapter)
 
     async def _run_secondary_profile_reconnect(
         self, profile_name: str, platform: Platform

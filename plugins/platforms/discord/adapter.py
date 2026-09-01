@@ -1000,6 +1000,63 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw in {"true", "1", "yes", "on"}
 
 
+def _jsonish(value: Any, default: Any) -> Any:
+    if value is None or value == "":
+        return default
+    if isinstance(value, (list, dict)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return default
+    return default
+
+
+def _csv_set(value: Any) -> set[str]:
+    parsed = _jsonish(value, value)
+    if isinstance(parsed, list):
+        return {str(v).strip() for v in parsed if str(v).strip()}
+    if isinstance(parsed, str):
+        return {v.strip() for v in parsed.split(",") if v.strip()}
+    return set()
+
+
+def _csv_lower_set(value: Any) -> set[str]:
+    """Parse a JSON/list/CSV config value as normalized channel names."""
+    return {v.lower() for v in _csv_set(value) if v}
+
+
+def _mapping_of_str(value: Any) -> dict[str, str]:
+    parsed = _jsonish(value, {})
+    if not isinstance(parsed, dict):
+        return {}
+    return {str(k): str(v) for k, v in parsed.items() if str(k).strip() and str(v).strip()}
+
+
+def _mapping_of_str_lists(value: Any) -> dict[str, set[str]]:
+    parsed = _jsonish(value, {})
+    if not isinstance(parsed, dict):
+        return {}
+    out: dict[str, set[str]] = {}
+    for key, vals in parsed.items():
+        if isinstance(vals, list):
+            out[str(key)] = {str(v).strip() for v in vals if str(v).strip()}
+        elif isinstance(vals, str):
+            out[str(key)] = {v.strip() for v in vals.split(",") if v.strip()}
+    return out
+
+
+def _discord_cfg_value(key: str, default: Any = None) -> Any:
+    """Best-effort profile config lookup for Bumba Discord voice keys."""
+    try:
+        from hermes_cli.config import read_raw_config
+        cfg = read_raw_config() or {}
+        return (cfg.get("discord") or {}).get(key, default)
+    except Exception:
+        return default
+
+
 def _read_discord_prompt_timeout() -> int:
     """Return the timeout (in seconds) for Discord button views.
 
@@ -1147,6 +1204,70 @@ class DiscordAdapter(BasePlatformAdapter):
             "websocket_max_latency_seconds",
             30.0,
         )
+        self.VOICE_TIMEOUT = self._config_int(
+            "voice_empty_channel_timeout_seconds",
+            _discord_cfg_value("voice_empty_channel_timeout_seconds", self.VOICE_TIMEOUT),
+            env_key="HERMES_DISCORD_VOICE_EMPTY_TIMEOUT_SECONDS",
+        ) or self.VOICE_TIMEOUT
+        self._voice_auto_join = _env_bool(
+            "HERMES_DISCORD_VOICE_AUTO_JOIN",
+            bool(_discord_cfg_value("voice_auto_join", False)),
+        )
+        self._voice_auto_join_users = _csv_set(
+            os.getenv(
+                "HERMES_DISCORD_VOICE_AUTO_JOIN_USERS",
+                _discord_cfg_value("voice_auto_join_users", []),
+            )
+        )
+        self._voice_auto_join_text_channel_id = _mapping_of_str(
+            os.getenv(
+                "HERMES_DISCORD_VOICE_AUTO_JOIN_TEXT_CHANNEL_ID",
+                _discord_cfg_value("voice_auto_join_text_channel_id", {}),
+            )
+        )
+        self._voice_preferred_channel_id = _mapping_of_str(
+            os.getenv(
+                "HERMES_DISCORD_VOICE_PREFERRED_CHANNEL_ID",
+                _discord_cfg_value("voice_preferred_channel_id", {}),
+            )
+        )
+        self._voice_allowed_channel_ids = _mapping_of_str_lists(
+            os.getenv(
+                "HERMES_DISCORD_VOICE_ALLOWED_CHANNEL_IDS",
+                _discord_cfg_value("voice_allowed_channel_ids", {}),
+            )
+        )
+        self._voice_allowed_channel_names = _csv_lower_set(
+            os.getenv(
+                "HERMES_DISCORD_VOICE_ALLOWED_CHANNEL_NAMES",
+                _discord_cfg_value("voice_allowed_channel_names", []),
+            )
+        )
+        self._voice_denied_channel_names = _csv_lower_set(
+            os.getenv(
+                "HERMES_DISCORD_VOICE_DENIED_CHANNEL_NAMES",
+                _discord_cfg_value("voice_denied_channel_names", []),
+            )
+        )
+        self._voice_auto_join_active_text_channels: set[str] = set()
+        self._voice_auto_join_ready_sweep_done = False
+        self._on_voice_auto_join: Optional[Callable] = None
+        namesake_enabled_raw = os.getenv(
+            "HERMES_DISCORD_VOICE_NAMESAKE_GREETING_ENABLED",
+            str(_discord_cfg_value("voice_namesake_greeting_enabled", False)),
+        )
+        self._voice_namesake_greeting_enabled = str(namesake_enabled_raw).strip().lower() in {"true", "1", "yes", "on"}
+        self._voice_namesake_greeting_channel_ids = _csv_set(
+            os.getenv(
+                "HERMES_DISCORD_VOICE_NAMESAKE_GREETING_CHANNEL_IDS",
+                _discord_cfg_value("voice_namesake_greeting_channel_ids", []),
+            )
+        )
+        self._voice_namesake_greeting_message = os.getenv(
+            "HERMES_DISCORD_VOICE_NAMESAKE_GREETING_MESSAGE",
+            str(_discord_cfg_value("voice_namesake_greeting_message", "Hello, Bumba here. How can I help?")),
+        )
+        self._voice_greeted_channel_ids: set[str] = set()
         self._liveness_task: Optional[asyncio.Task] = None
         self._liveness_notification_task: Optional[asyncio.Task] = None
         # True while disconnect() is intentionally closing discord.py. The
@@ -1390,6 +1511,7 @@ class DiscordAdapter(BasePlatformAdapter):
             @self._client.event
             async def on_ready():
                 logger.info("[%s] Connected as %s", adapter_self.name, adapter_self._client.user)
+                adapter_self._log_voice_policy_on_ready()
 
                 # Resolve any usernames in the allowed list to numeric IDs
                 await adapter_self._resolve_allowed_usernames()
@@ -1402,6 +1524,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 if adapter_self._missed_message_backfill_enabled():
                     adapter_self._ensure_missed_message_backfill_task()
+                await adapter_self._reconcile_auto_join_voice_on_ready()
 
             @self._client.event
             async def on_message(message: DiscordMessage):
@@ -1426,6 +1549,8 @@ class DiscordAdapter(BasePlatformAdapter):
             @self._client.event
             async def on_voice_state_update(member, before, after):
                 """Track voice channel join/leave events."""
+                await adapter_self._maybe_auto_join_voice_from_state(member, before, after)
+                await adapter_self._handle_tracked_user_voice_state(member, before, after)
                 # Only track channels where the bot is connected
                 bot_guild_ids = set(adapter_self._voice_clients.keys())
                 if not bot_guild_ids:
@@ -4348,7 +4473,21 @@ class DiscordAdapter(BasePlatformAdapter):
             return default
 
     def _load_voice_timeout(self) -> int:
-        """Return voice-channel inactivity timeout seconds; 0 disables it."""
+        """Return voice-channel inactivity timeout seconds; 0 disables it.
+
+        Bumba's Discord voice contract uses the explicit empty-channel key for
+        auto-leave behavior. Prefer it over the legacy inactivity key so the
+        scheduler and startup policy log resolve the same timeout value.
+        """
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            discord_cfg = cfg.get("discord") or {}
+            if "voice_empty_channel_timeout_seconds" in discord_cfg:
+                raw = discord_cfg.get("voice_empty_channel_timeout_seconds")
+                return max(0, int(self.VOICE_TIMEOUT if raw is None else raw))
+        except Exception as e:
+            logger.debug("Could not load discord.voice_empty_channel_timeout_seconds config: %s", e)
         return self._load_discord_int_config(
             "voice_channel_inactivity_timeout_seconds",
             self.VOICE_TIMEOUT,
@@ -4551,6 +4690,305 @@ class DiscordAdapter(BasePlatformAdapter):
         mixers = getattr(self, "_voice_mixers", None)
         return bool(mixers) and mixers.get(guild_id) is not None
 
+    @staticmethod
+    def _voice_channel_name(channel) -> str:
+        return str(getattr(channel, "name", "") or "").strip().lower()
+
+    def _voice_channel_allowed_by_policy(self, guild_id: str, channel) -> bool:
+        """Return True only for fleet-approved voice channels.
+
+        IDs remain supported for exact Discord routing, while names provide the
+        fleet-level sibling deny gate (`marcion-voice`, `muse-voice`, etc.).
+        If a names allowlist is configured, it is authoritative and must match.
+        """
+        channel_id = str(getattr(channel, "id", "") or "")
+        channel_name = self._voice_channel_name(channel)
+        denied_names = getattr(self, "_voice_denied_channel_names", set())
+        if channel_name and channel_name in denied_names:
+            logger.info(
+                "Discord voice auto-join denied sibling channel %s in guild %s",
+                channel_name,
+                guild_id,
+            )
+            return False
+        allowed_names = getattr(self, "_voice_allowed_channel_names", set())
+        if allowed_names and channel_name not in allowed_names:
+            logger.info(
+                "Discord voice auto-join denied non-namesake channel %s in guild %s",
+                channel_name or channel_id,
+                guild_id,
+            )
+            return False
+        allowed_ids = getattr(self, "_voice_allowed_channel_ids", {}).get(guild_id, set())
+        if allowed_ids and channel_id not in allowed_ids:
+            return False
+        return True
+
+    def _log_voice_policy_on_ready(self) -> None:
+        """Make the loaded Bumba voice policy visible after gateway startup."""
+        logger.info(
+            "Discord voice policy loaded: auto_join=%s allowed_channel_names=%s "
+            "denied_channel_names=%s allowed_channel_ids=%s text_bindings=%s "
+            "namesake_greeting_enabled=%s namesake_greeting_channel_ids=%s "
+            "empty_channel_timeout_seconds=%s tts_route=active_voice_client_playback",
+            getattr(self, "_voice_auto_join", False),
+            sorted(getattr(self, "_voice_allowed_channel_names", set())),
+            sorted(getattr(self, "_voice_denied_channel_names", set())),
+            {
+                guild: sorted(ids)
+                for guild, ids in getattr(self, "_voice_allowed_channel_ids", {}).items()
+            },
+            getattr(self, "_voice_auto_join_text_channel_id", {}),
+            getattr(self, "_voice_namesake_greeting_enabled", False),
+            sorted(getattr(self, "_voice_namesake_greeting_channel_ids", set())),
+            getattr(self, "VOICE_TIMEOUT", None),
+        )
+
+    async def _reconcile_auto_join_voice_on_ready(self) -> None:
+        """Join an approved user's existing voice session after gateway startup.
+
+        Discord only emits ``on_voice_state_update`` for changes after this
+        client is online. If the approved user is already in an approved voice
+        channel when the gateway starts/restarts, a one-shot ready sweep is
+        required to restore Bumba's expected presence.
+        """
+        if getattr(self, "_voice_auto_join_ready_sweep_done", False):
+            return
+        self._voice_auto_join_ready_sweep_done = True
+        if not getattr(self, "_voice_auto_join", False):
+            logger.info("Discord voice auto-join ready sweep skipped: disabled")
+            return
+        if not getattr(self, "_voice_input_callback", None):
+            logger.warning("Discord voice auto-join ready sweep skipped: voice input callback not wired")
+            return
+        client = getattr(self, "_client", None)
+        guilds = list(getattr(client, "guilds", []) or [])
+        tracked = getattr(self, "_voice_auto_join_users", set())
+        if not guilds or not tracked:
+            logger.info("Discord voice auto-join ready sweep skipped: guilds=%d tracked_users=%d", len(guilds), len(tracked))
+            return
+        for guild in guilds:
+            guild_id = str(getattr(guild, "id", ""))
+            if not guild_id:
+                continue
+            for channel in getattr(guild, "voice_channels", []) or []:
+                channel_id = str(getattr(channel, "id", "") or "")
+                if not self._voice_channel_allowed_by_policy(guild_id, channel):
+                    continue
+                for member in getattr(channel, "members", []) or []:
+                    user_id = str(getattr(member, "id", ""))
+                    if user_id not in tracked:
+                        continue
+                    logger.info(
+                        "Discord voice auto-join ready sweep found approved user %s in channel %s guild %s",
+                        user_id,
+                        getattr(channel, "name", channel_id),
+                        guild_id,
+                    )
+                    before = type("VoiceState", (), {"channel": None})()
+                    after = type("VoiceState", (), {"channel": channel})()
+                    await self._maybe_auto_join_voice_from_state(member, before, after)
+                    return
+        logger.info("Discord voice auto-join ready sweep found no approved user in configured voice channels")
+
+    async def _maybe_auto_join_voice_from_state(self, member, before, after) -> None:
+        """Auto-follow approved users into configured Bumba voice channels."""
+        if not getattr(self, "_voice_auto_join", False):
+            return
+        if member == getattr(self._client, "user", None):
+            return
+        user_id = str(getattr(member, "id", ""))
+        if user_id not in getattr(self, "_voice_auto_join_users", set()):
+            return
+        channel = getattr(after, "channel", None)
+        if channel is None:
+            return
+        guild = getattr(member, "guild", None)
+        guild_id = str(getattr(guild, "id", ""))
+        channel_id = str(getattr(channel, "id", ""))
+        if not guild_id or not channel_id:
+            return
+        preferred = getattr(self, "_voice_preferred_channel_id", {}).get(guild_id)
+        if not self._voice_channel_allowed_by_policy(guild_id, channel):
+            return
+        if preferred and channel_id != preferred:
+            logger.info(
+                "Discord voice auto-join: following approved user %s into allowed non-preferred channel %s",
+                user_id,
+                getattr(channel, "name", channel_id),
+            )
+        text_channel_raw = getattr(self, "_voice_auto_join_text_channel_id", {}).get(guild_id)
+        if not text_channel_raw:
+            logger.warning("Discord voice auto-join skipped: no text channel configured for guild %s", guild_id)
+            return
+        if not getattr(self, "_voice_input_callback", None):
+            logger.warning("Discord voice auto-join skipped: voice input callback not wired")
+            return
+        try:
+            text_channel_id = int(text_channel_raw)
+        except (TypeError, ValueError):
+            logger.warning("Invalid Discord voice auto-join text channel id: %s", text_channel_raw)
+            return
+        success = await self.join_voice_channel(
+            channel,
+            text_channel_id=text_channel_id,
+            source={
+                "platform": "discord",
+                "chat_id": str(text_channel_id),
+                "chat_type": "group",
+                "user_id": user_id,
+            },
+        )
+        if not success:
+            return
+        self._voice_auto_join_active_text_channels.add(str(text_channel_id))
+        if callable(getattr(self, "_on_voice_auto_join", None)):
+            self._on_voice_auto_join(str(text_channel_id))
+        logger.info(
+            "Discord voice auto-joined %s for approved user %s in guild %s",
+            getattr(channel, "name", channel_id),
+            user_id,
+            guild_id,
+        )
+        await self.maybe_play_namesake_greeting(channel)
+
+    async def maybe_play_namesake_greeting(self, channel) -> bool:
+        """Play the configured greeting only in namesake channels."""
+        if not getattr(self, "_voice_namesake_greeting_enabled", False):
+            return False
+        channel_id = str(getattr(channel, "id", ""))
+        if channel_id not in getattr(self, "_voice_namesake_greeting_channel_ids", set()):
+            return False
+        if channel_id in getattr(self, "_voice_greeted_channel_ids", set()):
+            return False
+        guild_id = getattr(getattr(channel, "guild", None), "id", None)
+        if guild_id is None:
+            return False
+        try:
+            from tools.tts_tool import text_to_speech_tool
+        except Exception as e:
+            logger.debug("Namesake greeting unavailable: %s", e)
+            return False
+        audio_path = os.path.join(
+            tempfile.gettempdir(),
+            "hermes_voice",
+            f"namesake_greeting_{int(time.time() * 1000)}.mp3",
+        )
+        try:
+            os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+            raw_result = await asyncio.to_thread(
+                text_to_speech_tool,
+                text=self._voice_namesake_greeting_message,
+                output_path=audio_path,
+            )
+            try:
+                result = json.loads(raw_result) if isinstance(raw_result, str) else {}
+            except Exception:
+                result = {}
+            play_paths = result.get("file_paths") or [result.get("file_path") or audio_path]
+            played = False
+            if result.get("success"):
+                for play_path in play_paths:
+                    played = await self.play_in_voice_channel(int(guild_id), play_path) or played
+        except Exception as e:
+            logger.debug("Namesake greeting failed: %s", e)
+            return False
+        if played:
+            self._voice_greeted_channel_ids.add(channel_id)
+        return bool(played)
+
+    async def _handle_tracked_user_voice_state(self, member, before, after) -> None:
+        """Keep Bumba present while approved users are in the same voice channel."""
+        user_id = str(getattr(member, "id", ""))
+        if user_id not in getattr(self, "_voice_auto_join_users", set()):
+            return
+        guild_id = getattr(getattr(member, "guild", None), "id", None)
+        if guild_id is None:
+            return
+        guild_id_int = int(guild_id)
+        vc = getattr(self, "_voice_clients", {}).get(guild_id_int)
+        if vc is None:
+            return
+        bot_channel = getattr(vc, "channel", None)
+        before_channel = getattr(before, "channel", None)
+        after_channel = getattr(after, "channel", None)
+
+        def _same_channel(left, right) -> bool:
+            if left is None or right is None:
+                return False
+            return str(getattr(left, "id", "")) == str(getattr(right, "id", ""))
+
+        # Trust the explicit voice-state transition before consulting
+        # channel.members. Discord.py can briefly expose stale members during a
+        # leave event; if the approved user left or moved away from Bumba's
+        # current channel, schedule the empty-channel timeout immediately.
+        if _same_channel(before_channel, bot_channel) and not _same_channel(after_channel, bot_channel):
+            self._reset_voice_timeout(guild_id_int)
+            return
+        if _same_channel(after_channel, bot_channel):
+            self._cancel_voice_timeout(guild_id_int)
+            return
+        if self._voice_channel_has_tracked_user(guild_id_int):
+            self._cancel_voice_timeout(guild_id_int)
+            return
+        self._reset_voice_timeout(guild_id_int)
+
+    def _voice_channel_has_tracked_user(self, guild_id: int) -> bool:
+        vc = getattr(self, "_voice_clients", {}).get(guild_id)
+        channel = getattr(vc, "channel", None) if vc else None
+        members = getattr(channel, "members", []) if channel else []
+        tracked = getattr(self, "_voice_auto_join_users", set())
+        bot_user = getattr(self._client, "user", None)
+        bot_id = str(getattr(bot_user, "id", "")) if bot_user else ""
+        for member in members:
+            member_id = str(getattr(member, "id", ""))
+            if member_id and member_id != bot_id and member_id in tracked:
+                return True
+        return False
+
+    # BUMBA-HARDEN: voice-binding persistence (D0 -> durable) for gateway:startup replay.
+    def _bumba_voice_bindings_path(self):
+        import os
+        from pathlib import Path
+        home = Path(os.environ.get('HERMES_HOME', str(Path.home() / '.hermes')))
+        return home / 'state' / 'voice_bindings.json'
+
+    def _bumba_load_voice_bindings(self, path):
+        import json
+        try:
+            raw = json.loads(path.read_text(encoding='utf-8'))
+        except Exception:
+            return []
+        b = raw.get('bindings', []) if isinstance(raw, dict) else []
+        return [x for x in b if isinstance(x, dict)]
+
+    def _bumba_write_voice_bindings(self, path, bindings):
+        import json, os
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + '.tmp')
+        tmp.write_text(json.dumps({'bindings': bindings}, indent=2, sort_keys=True), encoding='utf-8')
+        os.replace(tmp, path)
+
+    def _bumba_persist_voice_binding(self, guild_id, voice_channel_id, text_channel_id):
+        path = self._bumba_voice_bindings_path()
+        bindings = [b for b in self._bumba_load_voice_bindings(path) if str(b.get('guild_id')) != str(guild_id)]
+        bindings.append({
+            'guild_id': str(guild_id),
+            'voice_channel_id': str(voice_channel_id),
+            'text_channel_id': str(text_channel_id) if text_channel_id is not None else '',
+        })
+        self._bumba_write_voice_bindings(path, bindings)
+
+    def _bumba_remove_voice_binding(self, guild_id):
+        # BUMBA-HARDEN: do NOT drop the binding during gateway shutdown — the
+        # binding should survive a restart so upstream auto-join / a future
+        # restore can use it. Only a real user-driven leave clears it.
+        if getattr(self, '_disconnecting', False):
+            return
+        path = self._bumba_voice_bindings_path()
+        bindings = [b for b in self._bumba_load_voice_bindings(path) if str(b.get('guild_id')) != str(guild_id)]
+        self._bumba_write_voice_bindings(path, bindings)
+
     async def join_voice_channel(self, channel, *, text_channel_id: int = None, source: dict = None) -> bool:
         """Join a Discord voice channel. Returns True on success.
 
@@ -4578,6 +5016,11 @@ class DiscordAdapter(BasePlatformAdapter):
             vc = await channel.connect()
             self._voice_clients[guild_id] = vc
             self._reset_voice_timeout(guild_id)
+            # BUMBA-HARDEN: persist voice binding so gateway:startup can replay it.
+            try:
+                self._bumba_persist_voice_binding(guild_id, channel.id, text_channel_id)
+            except Exception:
+                pass
 
             # Store text-channel binding for automatic/programmatic joins
             # so voice transcriptions can be routed without /voice join.
@@ -4631,6 +5074,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 self._voice_mixers.pop(guild_id, None)
 
             vc = self._voice_clients.pop(guild_id, None)
+            # BUMBA-HARDEN: drop persisted voice binding on leave.
+            try:
+                self._bumba_remove_voice_binding(guild_id)
+            except Exception:
+                pass
+            # BUMBA-HARDEN: re-arm the namesake greeting on leave so a later
+            # rejoin greets again. Without this, _voice_greeted_channel_ids is
+            # only ever added to, so the bot greets once per gateway lifetime.
+            try:
+                _ch = getattr(vc, 'channel', None) if vc else None
+                if _ch is not None:
+                    self._voice_greeted_channel_ids.discard(str(_ch.id))
+            except Exception:
+                pass
             if vc and vc.is_connected():
                 try:
                     if vc.is_playing():
@@ -4768,6 +5225,17 @@ class DiscordAdapter(BasePlatformAdapter):
             self._voice_timeout_handler(guild_id, timeout)
         )
 
+    def _bumba_voice_channel_has_human(self, guild_id: int) -> bool:
+        # BUMBA-HARDEN: True if a non-bot member is still in the bot's voice channel.
+        try:
+            vc = self._voice_clients.get(guild_id)
+            if not vc or not vc.is_connected() or not getattr(vc, 'channel', None):
+                return False
+            bot_id = self._client.user.id if (self._client and self._client.user) else 0
+            return any(m.id != bot_id for m in vc.channel.members)
+        except Exception:
+            return False
+
     async def _voice_timeout_handler(self, guild_id: int, timeout: Optional[int] = None) -> None:
         """Auto-disconnect after the configured inactivity timeout."""
         timeout = self._voice_timeout_limit() if timeout is None else int(timeout)
@@ -4792,6 +5260,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     return
             except Exception:
                 pass
+        # BUMBA-HARDEN: honor the voice contract — leave ONLY when the channel is
+        # empty of humans, not merely after silence. A present-but-quiet human
+        # must NOT trigger a disconnect. Re-arm the timer instead.
+        if self._bumba_voice_channel_has_human(guild_id):
+            self._reset_voice_timeout(guild_id)
+            return
         await self.leave_voice_channel(guild_id)
         # Notify the runner so it can clean up voice_mode state
         if self._on_voice_disconnect and text_ch_id:

@@ -723,6 +723,19 @@ class TestDiscordVoiceChannelMethods:
         adapter._voice_receivers = {}
         adapter._voice_listen_tasks = {}
         adapter._voice_input_callback = None
+        adapter._on_voice_auto_join = None
+        adapter._voice_auto_join = False
+        adapter._voice_auto_join_users = set()
+        adapter._voice_auto_join_text_channel_id = {}
+        adapter._voice_preferred_channel_id = {}
+        adapter._voice_allowed_channel_ids = {}
+        adapter._voice_allowed_channel_names = set()
+        adapter._voice_denied_channel_names = set()
+        adapter._voice_auto_join_active_text_channels = set()
+        adapter._voice_namesake_greeting_enabled = False
+        adapter._voice_namesake_greeting_channel_ids = set()
+        adapter._voice_namesake_greeting_message = "Hello, Bumba here. How can I help?"
+        adapter._voice_greeted_channel_ids = set()
         adapter._allowed_user_ids = set()
         adapter._running = True
         return adapter
@@ -849,6 +862,199 @@ class TestDiscordVoiceChannelMethods:
 
         assert adapter._voice_timeout_seconds == 0
         assert adapter._playback_timeout_seconds == 240
+
+    def test_discord_bumba_empty_channel_timeout_config_loaded(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+        from gateway.config import PlatformConfig
+
+        with patch("hermes_cli.config.read_raw_config", return_value={
+            "discord": {
+                "voice_empty_channel_timeout_seconds": 30,
+            }
+        }):
+            adapter = DiscordAdapter(PlatformConfig(enabled=True, token="x"))
+
+        assert adapter.VOICE_TIMEOUT == 30
+
+    def test_discord_bumba_empty_channel_timeout_scheduler_loaded(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+        from gateway.config import PlatformConfig
+
+        with patch("hermes_cli.config.read_raw_config", return_value={
+            "discord": {
+                "voice_empty_channel_timeout_seconds": 30,
+            }
+        }):
+            adapter = DiscordAdapter(PlatformConfig(enabled=True, token="x"))
+
+        assert adapter._voice_timeout_seconds == 30
+        assert adapter._voice_timeout_limit() == 30
+
+    def test_discord_bumba_voice_auto_join_config_loaded(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+        from gateway.config import PlatformConfig
+
+        with patch("hermes_cli.config.read_raw_config", return_value={
+            "discord": {
+                "voice_auto_join": True,
+                "voice_auto_join_users": ["1003486059386130463"],
+                "voice_auto_join_text_channel_id": {"1476645829790929020": "1476645830898483345"},
+                "voice_preferred_channel_id": {"1476645829790929020": "1534095282114002964"},
+                "voice_allowed_channel_ids": {"1476645829790929020": ["1534095282114002964"]},
+                "voice_allowed_channel_names": "bumba-voice",
+                "voice_denied_channel_names": "marcion-voice,muse-voice,achilles-voice,apollo-voice,bredren-voice",
+                "voice_namesake_greeting_enabled": True,
+                "voice_namesake_greeting_channel_ids": ["1534095282114002964"],
+            }
+        }):
+            adapter = DiscordAdapter(PlatformConfig(enabled=True, token="x"))
+
+        assert adapter._voice_auto_join is True
+        assert adapter._voice_auto_join_users == {"1003486059386130463"}
+        assert adapter._voice_auto_join_text_channel_id == {"1476645829790929020": "1476645830898483345"}
+        assert adapter._voice_preferred_channel_id == {"1476645829790929020": "1534095282114002964"}
+        assert adapter._voice_allowed_channel_ids == {"1476645829790929020": {"1534095282114002964"}}
+        assert adapter._voice_allowed_channel_names == {"bumba-voice"}
+        assert adapter._voice_denied_channel_names == {"marcion-voice", "muse-voice", "achilles-voice", "apollo-voice", "bredren-voice"}
+        assert adapter._voice_namesake_greeting_enabled is True
+        assert adapter._voice_namesake_greeting_channel_ids == {"1534095282114002964"}
+
+    def test_discord_bumba_voice_auto_join_config_loaded_from_config_set_strings(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+        from gateway.config import PlatformConfig
+
+        with patch("hermes_cli.config.read_raw_config", return_value={
+            "discord": {
+                "voice_auto_join": True,
+                "voice_auto_join_users": "[\"1003486059386130463\"]",
+                "voice_auto_join_text_channel_id": "{\"1476645829790929020\":\"1476645830898483345\"}",
+                "voice_preferred_channel_id": "{\"1476645829790929020\":\"1534095282114002964\"}",
+                "voice_allowed_channel_ids": "{\"1476645829790929020\":[\"1534095282114002964\"]}",
+                "voice_allowed_channel_names": "[\"bumba-voice\"]",
+                "voice_denied_channel_names": "marcion-voice,muse-voice,achilles-voice,apollo-voice,bredren-voice",
+                "voice_namesake_greeting_enabled": True,
+                "voice_namesake_greeting_channel_ids": "[\"1534095282114002964\"]",
+            }
+        }):
+            adapter = DiscordAdapter(PlatformConfig(enabled=True, token="x"))
+
+        assert adapter._voice_auto_join is True
+        assert adapter._voice_auto_join_users == {"1003486059386130463"}
+        assert adapter._voice_auto_join_text_channel_id == {"1476645829790929020": "1476645830898483345"}
+        assert adapter._voice_preferred_channel_id == {"1476645829790929020": "1534095282114002964"}
+        assert adapter._voice_allowed_channel_ids == {"1476645829790929020": {"1534095282114002964"}}
+        assert adapter._voice_allowed_channel_names == {"bumba-voice"}
+        assert adapter._voice_denied_channel_names == {"marcion-voice", "muse-voice", "achilles-voice", "apollo-voice", "bredren-voice"}
+        assert adapter._voice_namesake_greeting_channel_ids == {"1534095282114002964"}
+
+    @pytest.mark.asyncio
+    async def test_bumba_auto_join_follows_approved_user_to_allowed_channel(self):
+        adapter = self._make_adapter()
+        adapter._voice_auto_join = True
+        adapter._voice_auto_join_users = {"1003486059386130463"}
+        adapter._voice_auto_join_text_channel_id = {"1476645829790929020": "1476645830898483345"}
+        adapter._voice_preferred_channel_id = {"1476645829790929020": "1534095282114002964"}
+        adapter._voice_allowed_channel_ids = {"1476645829790929020": {"1534095282114002964"}}
+        adapter._voice_allowed_channel_names = {"bumba-voice"}
+        adapter._voice_denied_channel_names = {"marcion-voice", "muse-voice", "achilles-voice", "apollo-voice", "bredren-voice"}
+        adapter._voice_input_callback = MagicMock()
+        seen_auto_join = []
+        adapter._on_voice_auto_join = lambda chat_id: seen_auto_join.append(chat_id)
+        adapter.join_voice_channel = AsyncMock(return_value=True)
+        adapter.maybe_play_namesake_greeting = AsyncMock(return_value=False)
+
+        guild = MagicMock()
+        guild.id = 1476645829790929020
+        channel = MagicMock()
+        channel.id = 1534095282114002964
+        channel.name = "bumba-voice"
+        channel.guild = guild
+        member = MagicMock()
+        member.id = 1003486059386130463
+        member.guild = guild
+        mock_client = MagicMock()
+        mock_client.user = MagicMock()
+        mock_client.user.id = 999
+        adapter._client = mock_client
+        before = MagicMock(channel=None)
+        after = MagicMock(channel=channel)
+
+        await adapter._maybe_auto_join_voice_from_state(member, before, after)
+
+        adapter.join_voice_channel.assert_awaited_once()
+        _, kwargs = adapter.join_voice_channel.await_args
+        assert kwargs["text_channel_id"] == 1476645830898483345
+        assert kwargs["source"]["chat_id"] == "1476645830898483345"
+        assert seen_auto_join == ["1476645830898483345"]
+        assert "1476645830898483345" in adapter._voice_auto_join_active_text_channels
+
+    @pytest.mark.asyncio
+    async def test_bumba_auto_join_denies_sibling_voice_channel(self):
+        adapter = self._make_adapter()
+        adapter._voice_auto_join = True
+        adapter._voice_auto_join_users = {"1003486059386130463"}
+        adapter._voice_auto_join_text_channel_id = {"1476645829790929020": "1476645830898483345"}
+        adapter._voice_allowed_channel_ids = {"1476645829790929020": {"1534095282114002964"}}
+        adapter._voice_allowed_channel_names = {"bumba-voice"}
+        adapter._voice_denied_channel_names = {"marcion-voice", "muse-voice", "achilles-voice", "apollo-voice", "bredren-voice"}
+        adapter._voice_input_callback = MagicMock()
+        adapter.join_voice_channel = AsyncMock(return_value=True)
+        adapter.maybe_play_namesake_greeting = AsyncMock(return_value=False)
+
+        guild = MagicMock()
+        guild.id = 1476645829790929020
+        channel = MagicMock()
+        channel.id = 1476645830898483346
+        channel.name = "bredren-voice"
+        channel.guild = guild
+        member = MagicMock()
+        member.id = 1003486059386130463
+        member.guild = guild
+        adapter._client = MagicMock(user=MagicMock(id=999))
+
+        await adapter._maybe_auto_join_voice_from_state(
+            member,
+            MagicMock(channel=None),
+            MagicMock(channel=channel),
+        )
+
+        adapter.join_voice_channel.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_bumba_approved_user_leave_schedules_empty_channel_timeout_even_with_stale_members(self):
+        adapter = self._make_adapter()
+        adapter._voice_auto_join_users = {"1003486059386130463"}
+        adapter._client = MagicMock(user=MagicMock(id=999))
+        adapter._reset_voice_timeout = MagicMock()
+        adapter._cancel_voice_timeout = MagicMock()
+
+        guild = MagicMock()
+        guild.id = 1476645829790929020
+        channel = MagicMock()
+        channel.id = 1534095282114002964
+        channel.name = "bumba-voice"
+        # Discord.py can present stale channel.members during the leave event.
+        # The explicit before/after transition must still schedule the timeout.
+        tracked_member = MagicMock()
+        tracked_member.id = 1003486059386130463
+        channel.members = [tracked_member, adapter._client.user]
+
+        vc = MagicMock()
+        vc.channel = channel
+        adapter._voice_clients[guild.id] = vc
+
+        member = MagicMock()
+        member.id = 1003486059386130463
+        member.guild = guild
+
+        await adapter._handle_tracked_user_voice_state(
+            member,
+            MagicMock(channel=channel),
+            MagicMock(channel=None),
+        )
+
+        adapter._reset_voice_timeout.assert_called_once_with(guild.id)
+        adapter._cancel_voice_timeout.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_playback_timeout_scales_with_audio_duration(self):
