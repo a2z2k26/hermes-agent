@@ -22097,7 +22097,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "Not in a voice channel."
 
         try:
-            await adapter.leave_voice_channel(guild_id)
+            # Deliberate /voice leave: forget the durable binding too, so the
+            # bot does not rejoin on the next restart.
+            try:
+                await adapter.leave_voice_channel(guild_id, clear_binding=True)
+            except TypeError:
+                await adapter.leave_voice_channel(guild_id)
         except Exception as e:
             logger.warning("Error leaving voice channel: %s", e)
         # Always clean up state even if leave raised an exception
@@ -22179,7 +22184,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # so voice input shares the same session as the bound text conversation.
         source_data = getattr(adapter, "_voice_sources", {}).get(guild_id)
         if source_data:
-            source = SessionSource.from_dict(source_data)
+            # A malformed source used to raise a bare KeyError inside the voice
+            # listen loop, where it was swallowed as "Voice input processing
+            # failed: 'platform'" -- speech was transcribed and then discarded
+            # with no usable diagnosis. Name the problem instead.
+            try:
+                source = SessionSource.from_dict(source_data)
+            except (KeyError, ValueError, TypeError) as exc:
+                logger.error(
+                    "Voice source for guild %s is malformed (%s: %s); keys=%s. "
+                    "Voice input cannot be routed to a session.",
+                    guild_id, type(exc).__name__, exc, sorted(source_data),
+                )
+                return
             source.user_id = str(user_id)
             source.user_name = str(user_id)
         else:
