@@ -4961,6 +4961,25 @@ class DiscordAdapter(BasePlatformAdapter):
         # newer trees (muse/apollo) already implement. Falls back to the old
         # deferral when the key is unset.
         _empty_timeout = self._config_value("voice_empty_channel_timeout_seconds", None)
+        if _empty_timeout is None:
+            # config.extra unexpectedly lacks this key at runtime even though
+            # sibling voice_* keys resolve (observed 2026-09-01; extra-builder
+            # question parked in the P3 notes). Read the source config directly
+            # so behavior does not depend on that mystery.
+            try:
+                import yaml as _yaml
+                _cfg_path = os.path.join(
+                    os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
+                    "config.yaml",
+                )
+                with open(_cfg_path, "r", encoding="utf-8") as _fh:
+                    _empty_timeout = (
+                        (_yaml.safe_load(_fh) or {}).get("discord", {}) or {}
+                    ).get("voice_empty_channel_timeout_seconds")
+                if _empty_timeout is not None:
+                    logger.info("Empty-channel timeout resolved from config.yaml fallback: %s", _empty_timeout)
+            except Exception:
+                _empty_timeout = None
         try:
             _empty_timeout = float(_empty_timeout) if _empty_timeout is not None else None
         except (TypeError, ValueError):
