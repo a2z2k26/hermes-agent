@@ -1486,6 +1486,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
             self._running = True
             self._start_liveness_probe()
+            self._log_voice_policy_summary()
+            asyncio.create_task(self._reconcile_voice_auto_join_on_ready())
             # Plugin-registered native handlers (discord.py Bot — add_listener()/event hooks).
             self._wire_plugin_handlers(self._client)
             return True
@@ -4485,6 +4487,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
 
         self._mark_voice_chat_enabled(str(text_channel_id))
+        self._persist_voice_binding(int(guild_id), int(getattr(channel, "id", 0) or 0), text_channel_id)
         logger.info(
             "Voice auto-joined %s (%s) for user %s; linked text channel %s",
             getattr(channel, "name", getattr(channel, "id", "?")),
@@ -4614,6 +4617,184 @@ class DiscordAdapter(BasePlatformAdapter):
         if allowed_ids or allowed_names:
             return channel_id.lower() in allowed_ids or channel_name in allowed_names
         return True
+
+    # ── Ported from Muse's voice architecture (fleet unification, 2026-09-01).
+    # Three features the candidate lineage lacked, adapted to its accessors:
+    # startup policy logging (the diagnosability that would have caught the
+    # 2026-08-31 config-drift outages instantly), binding persistence, and
+    # the on-ready reconcile that makes voice recoverable after a restart
+    # (closes remediation-plan D4/APO-08). Original rationale docstrings
+    # preserved from the Muse implementation.
+
+    def _log_voice_policy_summary(self) -> None:
+        """Log the resolved voice policy at startup.
+
+        Every value is read through the SAME accessors the auto-join gates
+        use, so this reports what the gates will actually see, not what the
+        YAML says. A voice policy that failed to load is otherwise
+        indistinguishable from one that loaded and correctly declined.
+        """
+        try:
+            extra = self.config.extra if isinstance(getattr(self.config, "extra", None), dict) else {}
+            logger.info(
+                "[%s] VOICE POLICY: auto_join=%s allowed_ids=%s allowed_names=%s "
+                "denied_ids=%s denied_names=%s auto_join_users=%s greeting_text=%r "
+                "empty_timeout=%s inactivity_timeout=%s extra_keys=%d",
+                self.name,
+                self._discord_voice_auto_join_enabled(),
+                sorted(self._discord_voice_config_set("voice_allowed_channel_ids")),
+                sorted(self._discord_voice_config_set("voice_allowed_channel_names")),
+                sorted(self._discord_voice_config_set("voice_denied_channel_ids")),
+                sorted(self._discord_voice_config_set("voice_denied_channel_names")),
+                sorted(self._discord_voice_auto_join_users()),
+                str(self._config_value("voice_join_greeting_text", "") or "")[:40],
+                self._config_value("voice_empty_channel_timeout_seconds", None),
+                self._config_value("voice_channel_inactivity_timeout_seconds", None),
+                len(extra),
+            )
+            if self._discord_voice_auto_join_enabled():
+                missing = []
+                if not (self._discord_voice_config_set("voice_allowed_channel_ids")
+                        or self._discord_voice_config_set("voice_allowed_channel_names")):
+                    missing.append("voice_allowed_channel_ids/names")
+                if not self._discord_voice_auto_join_users():
+                    missing.append("voice_auto_join_users")
+                if missing:
+                    logger.warning(
+                        "[%s] VOICE POLICY INCOMPLETE: %s empty as the gates see them; "
+                        "auto-join will silently decline. voice_* keys present: %s",
+                        self.name, missing,
+                        sorted(k for k in extra if str(k).startswith("voice_")),
+                    )
+        except Exception as exc:  # never let diagnostics break startup
+            logger.warning("[%s] VOICE POLICY: could not resolve (%s)", self.name, exc)
+
+    def _voice_bindings_path(self):
+        from pathlib import Path as _P
+        home = _P(os.environ.get("HERMES_HOME") or (_P.home() / ".hermes"))
+        return home / "state" / "voice_bindings.json"
+
+    def _persist_voice_binding(self, guild_id: int, channel_id: int, text_channel_id) -> None:
+        """Record the live voice binding to disk (atomic, best-effort).
+
+        self._voice_clients is in-memory only; this writes the binding back
+        so "which channel is the bot bound to?" is answerable from disk
+        instead of from a live object that dies with the process.
+        """
+        try:
+            import json as _json
+            from datetime import datetime as _dt, timezone as _tz
+            path = self._voice_bindings_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            existing = []
+            if path.is_file():
+                try:
+                    raw = _json.loads(path.read_text(encoding="utf-8"))
+                    existing = raw.get("bindings", []) if isinstance(raw, dict) else []
+                except Exception:
+                    existing = []
+            entry = {
+                "guild_id": str(guild_id),
+                "voice_channel_id": str(channel_id),
+                "text_channel_id": str(text_channel_id or ""),
+            }
+            kept = [b for b in existing if isinstance(b, dict) and str(b.get("guild_id")) != str(guild_id)]
+            kept.append(entry)
+            payload = {
+                "schema_version": 1,
+                "updated_at": _dt.now(_tz.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+                "bindings": sorted(kept, key=lambda b: str(b.get("guild_id"))),
+            }
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(_json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            tmp.replace(path)
+            logger.info("[%s] Voice binding persisted: guild=%s voice=%s", self.name, guild_id, channel_id)
+        except Exception as exc:  # noqa: BLE001 — never break a join over bookkeeping
+            logger.warning("[%s] Could not persist voice binding: %s", self.name, exc)
+
+    def _clear_voice_binding(self, guild_id: int) -> None:
+        """Drop one guild's persisted binding. Never deletes the file."""
+        try:
+            import json as _json
+            from datetime import datetime as _dt, timezone as _tz
+            path = self._voice_bindings_path()
+            if not path.is_file():
+                return
+            raw = _json.loads(path.read_text(encoding="utf-8"))
+            existing = raw.get("bindings", []) if isinstance(raw, dict) else []
+            kept = [b for b in existing if isinstance(b, dict) and str(b.get("guild_id")) != str(guild_id)]
+            if len(kept) == len(existing):
+                return
+            raw["bindings"] = kept
+            raw["updated_at"] = _dt.now(_tz.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(_json.dumps(raw, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            tmp.replace(path)
+            logger.info("[%s] Voice binding cleared: guild=%s", self.name, guild_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] Could not clear voice binding: %s", self.name, exc)
+
+    #: Delays (seconds) before each reconcile attempt after READY. Discord
+    #: populates voice-state caches from GUILD_CREATE, which can arrive around
+    #: or after READY, so a single immediate pass can observe an empty channel
+    #: and give up permanently. Retry briefly, then stop.
+    VOICE_RECONCILE_DELAYS = (0, 3, 8, 15)
+
+    async def _reconcile_voice_auto_join_on_ready(self) -> None:
+        """Auto-join an allowed user already sitting in an allowed channel.
+
+        Discord only emits on_voice_state_update for changes AFTER the bot is
+        online. If the gateway restarts while the approved human is already in
+        the channel, no join event fires — this reconcile pass is what makes
+        voice recoverable after a restart (D4/APO-08).
+        """
+        if not self._discord_voice_auto_join_enabled():
+            return
+        for attempt, delay in enumerate(self.VOICE_RECONCILE_DELAYS, start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            if self._voice_clients:
+                return  # already connected somewhere
+            if await self._reconcile_voice_auto_join_once(attempt, len(self.VOICE_RECONCILE_DELAYS)):
+                return
+        logger.info(
+            "[%s] Voice reconcile finished: no approved user present in an allowed "
+            "channel after %d attempt(s); will auto-join on the next join event.",
+            self.name, len(self.VOICE_RECONCILE_DELAYS),
+        )
+
+    async def _reconcile_voice_auto_join_once(self, attempt: int, total: int) -> bool:
+        """One reconcile pass. Returns True when a join was made."""
+        client = self._client
+        if client is None:
+            return False
+        allowed_users = self._discord_voice_auto_join_users()
+        scanned = 0
+        for guild in getattr(client, "guilds", []) or []:
+            for channel in getattr(guild, "voice_channels", []) or []:
+                if not self._discord_voice_channel_allowed(channel):
+                    continue
+                scanned += 1
+                for member in getattr(channel, "members", []) or []:
+                    if member == getattr(client, "user", None) or getattr(member, "bot", False):
+                        continue
+                    user_id = str(getattr(member, "id", ""))
+                    if allowed_users and "*" not in allowed_users and user_id not in allowed_users:
+                        continue
+                    if not self._is_allowed_user(user_id, author=member, guild=guild, is_dm=False):
+                        continue
+                    logger.info(
+                        "[%s] Reconcile: auto-joining %s (%s) for present user %s (attempt %d/%d)",
+                        self.name, getattr(channel, "name", ""), getattr(channel, "id", ""),
+                        user_id, attempt, total,
+                    )
+                    await self._maybe_auto_join_voice_channel(member, channel)
+                    return bool(self._voice_clients)
+        logger.info(
+            "[%s] Voice reconcile %d/%d: %d allowed channel(s) scanned, no approved user present",
+            self.name, attempt, total, scanned,
+        )
+        return False
 
     def _mark_voice_chat_enabled(self, chat_id: str) -> None:
         """Mirror voice-channel state after an automatic voice join.
@@ -5090,6 +5271,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def leave_voice_channel(self, guild_id: int) -> None:
         """Disconnect from the voice channel in a guild."""
+        self._clear_voice_binding(int(guild_id))
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
             # Stop voice receiver first
             receiver = self._voice_receivers.pop(guild_id, None)
