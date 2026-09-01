@@ -4963,9 +4963,46 @@ class DiscordAdapter(BasePlatformAdapter):
                 remaining_allowed_users.append(maybe_member)
         if remaining_allowed_users:
             return False
-        logger.info("Voice auto-leave deferred to inactivity timeout: no allowed users remain in channel=%s guild=%s", getattr(channel, "id", None), guild_id)
-        self._reset_voice_timeout(guild_id)
-        return False
+        # P3 backport (2026-08-31): honor voice_empty_channel_timeout_seconds
+        # directly instead of deferring to the (much longer) inactivity timer —
+        # the intended behavior is "leave ~30s after Andrew leaves", which the
+        # newer trees (muse/apollo) already implement. Falls back to the old
+        # deferral when the key is unset.
+        _empty_timeout = self._config_value("voice_empty_channel_timeout_seconds", None)
+        try:
+            _empty_timeout = float(_empty_timeout) if _empty_timeout is not None else None
+        except (TypeError, ValueError):
+            _empty_timeout = None
+        if _empty_timeout is None or _empty_timeout <= 0:
+            logger.info("Voice auto-leave deferred to inactivity timeout: no allowed users remain in channel=%s guild=%s", getattr(channel, "id", None), guild_id)
+            self._reset_voice_timeout(guild_id)
+            return False
+        logger.info(
+            "Voice auto-leave scheduled in %.0fs (empty channel %s, guild %s)",
+            _empty_timeout, getattr(channel, "id", None), guild_id,
+        )
+
+        async def _empty_channel_leave() -> None:
+            await asyncio.sleep(_empty_timeout)
+            vc_now = self._voice_clients.get(guild_id)
+            if not vc_now or getattr(getattr(vc_now, "channel", None), "id", None) != getattr(channel, "id", None):
+                return  # already left or moved
+            for m in getattr(getattr(vc_now, "channel", None), "members", []) or []:
+                if getattr(m, "bot", False):
+                    continue
+                if self._is_allowed_user(
+                    str(getattr(m, "id", "")), author=m,
+                    guild=getattr(m, "guild", None), is_dm=False,
+                ):
+                    return  # an authorized user came back — stay
+            try:
+                await self.leave_voice_channel(guild_id)
+                logger.info("Voice auto-left empty channel %s after %.0fs", getattr(channel, "id", None), _empty_timeout)
+            except Exception:
+                logger.warning("Empty-channel auto-leave failed", exc_info=True)
+
+        asyncio.create_task(_empty_channel_leave())
+        return True
 
     async def join_voice_channel(self, channel, *, text_channel_id: int = None, source: dict = None) -> bool:
         """Join a Discord voice channel. Returns True on success.
