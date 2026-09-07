@@ -134,6 +134,7 @@ def check_system_tools():
                 if not opus_path:
                     # Platform-specific fallback paths
                     candidates = [
+                        os.path.expanduser("~/.local/lib/libopus.dylib"),  # macOS user-local/source build
                         "/opt/homebrew/lib/libopus.dylib",   # macOS Apple Silicon
                         "/usr/local/lib/libopus.dylib",      # macOS Intel
                         "/usr/lib/x86_64-linux-gnu/libopus.so.0",  # Debian/Ubuntu x86

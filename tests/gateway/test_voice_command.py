@@ -850,6 +850,111 @@ class TestDiscordVoiceChannelMethods:
         assert adapter._voice_timeout_seconds == 0
         assert adapter._playback_timeout_seconds == 240
 
+    def test_voice_namesake_allow_deny_policy(self):
+        adapter = self._make_adapter()
+        adapter.config.extra.update({
+            "voice_allowed_channel_ids": "1534095458559856721",
+            "voice_allowed_channel_names": "muse-voice",
+            "voice_denied_channel_names": "marcion-voice,bumba-voice,achilles-voice",
+        })
+        muse = SimpleNamespace(id=1534095458559856721, name="muse-voice")
+        bumba = SimpleNamespace(id=1534095282114002964, name="bumba-voice")
+        random = SimpleNamespace(id=999, name="random-voice")
+
+        assert adapter._voice_channel_allowed_by_policy(muse) is True
+        assert adapter._voice_channel_allowed_by_policy(bumba) is False
+        assert adapter._voice_channel_allowed_by_policy(random) is False
+
+    @pytest.mark.asyncio
+    async def test_voice_auto_join_only_namesake_allowed_user(self):
+        adapter = self._make_adapter()
+        adapter.config.extra.update({
+            "voice_auto_join_enabled": True,
+            "voice_auto_join_user_ids": "1003486059386130463",
+            "voice_allowed_channel_ids": "1534095458559856721",
+            "voice_default_text_channel_id": "1476645830898483345",
+        })
+        adapter.join_voice_channel = AsyncMock(return_value=True)
+        member = SimpleNamespace(id=1003486059386130463)
+        before = SimpleNamespace(channel=None)
+        channel = SimpleNamespace(id=1534095458559856721, name="muse-voice")
+        after = SimpleNamespace(channel=channel)
+
+        await adapter._maybe_auto_join_voice_channel(member, before, after)
+
+        adapter.join_voice_channel.assert_awaited_once_with(
+            channel,
+            text_channel_id=1476645830898483345,
+            source={"kind": "voice_auto_join", "user_id": "1003486059386130463"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_voice_auto_join_reconciles_user_already_in_namesake_on_ready(self):
+        adapter = self._make_adapter()
+        adapter.config.extra.update({
+            "voice_auto_join_enabled": True,
+            "voice_auto_join_user_ids": "1003486059386130463",
+            "voice_allowed_channel_ids": "1534095458559856721",
+            "voice_default_text_channel_id": "1503114294936600717",
+        })
+        adapter.join_voice_channel = AsyncMock(return_value=True)
+        bot_user = SimpleNamespace(id=1503110641471324190)
+        allowed_member = SimpleNamespace(id=1003486059386130463)
+        channel = SimpleNamespace(
+            id=1534095458559856721,
+            name="muse-voice",
+            members=[allowed_member, bot_user],
+        )
+        adapter._client = SimpleNamespace(
+            user=bot_user,
+            guilds=[SimpleNamespace(voice_channels=[channel])],
+        )
+
+        await adapter._reconcile_voice_auto_join_on_ready()
+
+        adapter.join_voice_channel.assert_awaited_once_with(
+            channel,
+            text_channel_id=1503114294936600717,
+            source={"kind": "voice_auto_join_reconcile", "user_id": "1003486059386130463"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_voice_auto_join_denies_sibling_channel(self):
+        adapter = self._make_adapter()
+        adapter.config.extra.update({
+            "voice_auto_join_enabled": True,
+            "voice_auto_join_user_ids": "1003486059386130463",
+            "voice_allowed_channel_names": "muse-voice",
+            "voice_denied_channel_names": "marcion-voice,bumba-voice,achilles-voice",
+        })
+        adapter.join_voice_channel = AsyncMock(return_value=True)
+        member = SimpleNamespace(id=1003486059386130463)
+        before = SimpleNamespace(channel=None)
+        after = SimpleNamespace(channel=SimpleNamespace(id=1534095282114002964, name="bumba-voice"))
+
+        await adapter._maybe_auto_join_voice_channel(member, before, after)
+
+        adapter.join_voice_channel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_voice_join_greeting_namesake_only(self):
+        adapter = self._make_adapter()
+        adapter.config.extra.update({
+            "voice_join_greeting_enabled": True,
+            "voice_join_greeting_text": "Hello, Muse here. How can I help?",
+            "voice_join_greeting_channel_names": "muse-voice",
+        })
+        adapter._voice_greeting_cache = {"111:1534095458559856721": "/tmp/muse-greeting.mp3"}
+        adapter.play_in_voice_channel = AsyncMock(return_value=True)
+        muse = SimpleNamespace(id=1534095458559856721, name="muse-voice")
+        sibling = SimpleNamespace(id=1534095282114002964, name="bumba-voice")
+
+        with patch("plugins.platforms.discord.adapter.os.path.isfile", return_value=True):
+            await adapter._play_voice_join_greeting(111, muse)
+            await adapter._play_voice_join_greeting(111, sibling)
+
+        adapter.play_in_voice_channel.assert_awaited_once_with(111, "/tmp/muse-greeting.mp3")
+
     @pytest.mark.asyncio
     async def test_playback_timeout_scales_with_audio_duration(self):
         adapter = self._make_adapter()

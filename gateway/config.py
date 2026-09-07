@@ -1735,6 +1735,20 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["group_allow_admin_from"] = platform_cfg["group_allow_admin_from"]
                 if "group_user_allowed_commands" in platform_cfg:
                     bridged["group_user_allowed_commands"] = platform_cfg["group_user_allowed_commands"]
+                # Voice policy keys. The Discord adapter resolves every voice
+                # gate through ``config.extra`` (_config_value -> self.config.extra),
+                # so a voice_* key that is not bridged here NEVER reaches the
+                # adapter and every gate silently falls back to its default --
+                # which for voice_auto_join_enabled is False. That is a silent
+                # feature-off with no log line anywhere, and it is why Muse
+                # stopped joining its namesake voice channel after 2026-08-10
+                # while ~/.hermes/config.yaml was correct the whole time.
+                # Bridged by prefix so a new voice_* setting cannot regress the
+                # same way.
+                if plat == Platform.DISCORD:
+                    for _vkey, _vval in platform_cfg.items():
+                        if str(_vkey).startswith("voice_") and _vval is not None:
+                            bridged[_vkey] = _vval
                 if plat in {Platform.DISCORD, Platform.SLACK} and "channel_skill_bindings" in platform_cfg:
                     bridged["channel_skill_bindings"] = platform_cfg["channel_skill_bindings"]
                 if "channel_prompts" in platform_cfg:

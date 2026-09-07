@@ -2321,6 +2321,20 @@ DEFAULT_CONFIG = {
         # Discord voice-channel inactivity timeout, in seconds. Set to 0 to
         # keep the bot in VC until an explicit `/voice leave` / disconnect.
         "voice_channel_inactivity_timeout_seconds": 300,
+        # Optional namesake voice-room adoption controls. These are inert until
+        # explicitly configured by a profile/harness; they let one agent bind
+        # itself to its own voice channel without broadening sibling rooms.
+        "voice_auto_join_enabled": False,
+        "voice_auto_join_user_ids": "",
+        "voice_allowed_channel_ids": "",
+        "voice_allowed_channel_names": "",
+        "voice_denied_channel_ids": "",
+        "voice_denied_channel_names": "",
+        "voice_default_text_channel_id": "",
+        "voice_join_greeting_enabled": False,
+        "voice_join_greeting_text": "",
+        "voice_join_greeting_channel_ids": "",
+        "voice_join_greeting_channel_names": "",
         # Minimum seconds to wait for a VC playback before force-stopping it.
         # The adapter also probes clip duration and extends this floor by a
         # padding window, so long TTS readbacks are not cut at exactly 120s.
