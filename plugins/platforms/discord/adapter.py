@@ -268,14 +268,13 @@ if DISCORD_AVAILABLE:
         """Discord-native review card for Obsidian Inbox items."""
 
         ACTION_OPTIONS = [
-            ("Brain / Knowledge [b/k]", "brain", "Promote/mark as Knowledge Base"),
-            ("Studio / Creative [s]", "studio", "Promote/mark as Creative Studio"),
-            ("Receipt [r]", "receipt", "Classify as receipt/bill/expense"),
-            ("Calendar Event [c]", "event", "Classify as calendar/event candidate"),
-            ("Job Description [j]", "job-opportunity", "Classify as job opportunity"),
-            ("GitHub Repo / Project [g]", "github-repository", "Classify as GitHub repo/project"),
-            ("Negative Reference [x]", "negative-reference", "Classify as anti-pattern/reference"),
-            ("Delete from Vault [d]", "delete", "Delete staged vault note/copy with ledger"),
+            ('Brain / Knowledge [b/k]', 'brain', 'Promote/mark as Knowledge Base'),
+            ('Studio / Creative [s]', 'studio', 'Promote/mark as Creative Studio'),
+            ('Receipt [r]', 'receipt', 'Classify as receipt/bill/expense'),
+            ('Calendar Event [c]', 'event', 'Classify as calendar/event candidate'),
+            ('Job Description [j]', 'job-opportunity', 'Classify as job opportunity'),
+            ('Watch this [w]', 'watch', 'Queue as a watch candidate'),
+            ('Delete from Vault [d]', 'delete', 'Delete staged vault note/copy with ledger'),
         ]
 
         def __init__(
@@ -432,10 +431,11 @@ if DISCORD_AVAILABLE:
                 await interaction.edit_original_response(content=f"Inbox Review action failed: {exc}", view=self)
                 return
             self.decisions.append({"action": action, **(result if isinstance(result, dict) else {})})
-            try:
-                self.items = list(self.manager.discover_items(limit=100))
-            except Exception:
-                self.items.pop(self.index)
+            # ACH-35 snapshot: work the snapshot taken when the session started rather than
+            # re-querying the vault. Re-querying meant items staged by intake DURING a
+            # session refilled the list, so `if not self.items` never became true and the
+            # session could not complete. New arrivals are picked up by the next review.
+            self.items.pop(self.index)
             self.index = 0
             if not self.items:
                 await self._finish(interaction)

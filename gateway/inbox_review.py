@@ -234,6 +234,36 @@ class InboxReviewManager:
                 }
             return self._delete_review_item(note, user=user)
 
+        if normalized == "watch":
+            # ACH-07 / O6: fire-and-forget watch-candidates queue append per BUILD-00 4A.
+            # Returns EARLY, like the delete branch above: watch must not set
+            # review_needed=false or rewrite the note. The item stays in the inbox for
+            # later human review - that is what "watch this" means.
+            try:
+                import json as _json
+                import secrets as _secrets
+                from datetime import timezone as _timezone
+        
+                _ts = datetime.now(_timezone.utc).isoformat(timespec="seconds")
+                _queue_dir = Path(self.vault_path) / "_meta" / "queues" / "watch-candidates"
+                _queue_dir.mkdir(parents=True, exist_ok=True)
+                _payload = {
+                    "item_ref": str(note),
+                    "proposed_by": "achilles",
+                    "ts": _ts,
+                }
+                _safe = re.sub(r"[^0-9A-Za-z_.+-]+", "-", _ts)
+                _target = _queue_dir / f"{_safe}-achilles-{_secrets.token_hex(2)}.json"
+                _target.write_text(_json.dumps(_payload, sort_keys=True) + "\n", encoding="utf-8")
+            except Exception as _exc:
+                return {"success": False, "error": f"watch queue append failed: {_exc}"}
+            return {
+                "success": True,
+                "action": normalized,
+                "note_path": str(note),
+                "queued": str(_target),
+            }
+
         if normalized in CONTENT_TYPE_ACTIONS:
             metadata = CONTENT_TYPE_ACTIONS[normalized]
             review_status = str(metadata["review_status"])
