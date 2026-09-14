@@ -1297,12 +1297,21 @@ class DiscordAdapter(BasePlatformAdapter):
                 _homebrew_paths = (
                     "/opt/homebrew/lib/libopus.dylib",  # Apple Silicon
                     "/usr/local/lib/libopus.dylib",     # Intel Mac
+                    os.path.expanduser("~/.local/lib/libopus.dylib"),  # user-local/source build (fleet: muse)
                 )
                 if sys.platform == "darwin":
                     for _hp in _homebrew_paths:
                         if os.path.isfile(_hp):
                             opus_candidates.append(_hp)
                             break
+                    # Last resort on macOS: the libopus that PyAV ships inside the venv (every fleet host has it).
+                    try:
+                        import av as _av  # noqa: F401
+                        _av_opus = os.path.join(os.path.dirname(_av.__file__), ".dylibs", "libopus.0.dylib")
+                        if os.path.isfile(_av_opus):
+                            opus_candidates.append(_av_opus)
+                    except Exception:
+                        pass
             for opus_path in opus_candidates:
                 try:
                     discord.opus.load_opus(opus_path)
