@@ -468,6 +468,7 @@ class TestVoiceChannelCommands:
         """Successful join sets voice_mode and returns confirmation."""
         mock_channel = MagicMock()
         mock_channel.name = "General"
+        mock_channel.id = int(os.environ.get("DISCORD_ALLOWED_VOICE_CHANNELS", "1536632245412958228").split(",")[0])
         mock_adapter = AsyncMock()
         mock_adapter.join_voice_channel = AsyncMock(return_value=True)
         mock_adapter.get_user_voice_channel = AsyncMock(return_value=mock_channel)
@@ -480,7 +481,8 @@ class TestVoiceChannelCommands:
         runner.adapters[event.source.platform] = mock_adapter
         result = await runner._handle_voice_channel_join(event)
         assert "General" in result
-        assert runner._voice_mode["discord:123"] == "all"
+        # Fleet 739e47e78a: /voice join persists voice_only so the bound text chat stays text.
+        assert runner._voice_mode["discord:123"] == "voice_only"
         assert mock_adapter._voice_sources[111]["chat_id"] == "123"
         assert mock_adapter._voice_sources[111]["chat_type"] == "group"
 
@@ -490,6 +492,7 @@ class TestVoiceChannelCommands:
         """Missing PyNaCl/davey should return a user-actionable install hint."""
         mock_channel = MagicMock()
         mock_channel.name = "General"
+        mock_channel.id = int(os.environ.get("DISCORD_ALLOWED_VOICE_CHANNELS", "1536632245412958228").split(",")[0])
         mock_adapter = AsyncMock()
         mock_adapter.join_voice_channel = AsyncMock(
             side_effect=RuntimeError("PyNaCl library needed in order to use voice")
@@ -751,6 +754,21 @@ class TestDiscordVoiceChannelMethods:
         ]
 
 
+    @pytest.mark.asyncio
+    async def test_send_voice_plays_bound_text_chat_audio_in_voice_channel(self):
+        adapter = self._make_adapter()
+        adapter._voice_text_channels = {111: 123}
+        adapter.is_in_voice_channel = MagicMock(return_value=True)
+        adapter.play_in_voice_channel = AsyncMock(return_value=True)
+        adapter._client.get_channel = MagicMock()
+
+        result = await adapter.send_voice(chat_id="123", audio_path="/tmp/reply.mp3")
+
+        assert result.success is True
+        adapter.play_in_voice_channel.assert_awaited_once_with(111, "/tmp/reply.mp3")
+        adapter._client.get_channel.assert_not_called()
+
+
     def test_voice_timeout_zero_disables_auto_leave(self):
         adapter = self._make_adapter()
         adapter._voice_timeout_seconds = 0
@@ -776,6 +794,442 @@ class TestDiscordVoiceChannelMethods:
 
         assert adapter._voice_timeout_seconds == 0
         assert adapter._playback_timeout_seconds == 240
+
+    def test_voice_auto_join_config_helpers_allow_configured_channel(self):
+        adapter = self._make_adapter()
+
+        def config_value(key, default=None, env_key=None):
+            values = {
+                "voice_auto_join": True,
+                "voice_auto_join_users": "42",
+                "voice_auto_join_text_channel_id": "123",
+                "voice_allowed_channel_names": "apollo-voice",
+            }
+            return values.get(key, default)
+
+        adapter._config_value = MagicMock(side_effect=config_value)
+        channel = SimpleNamespace(id=456, name="apollo-voice")
+
+        assert adapter._discord_voice_auto_join_enabled() is True
+        assert adapter._discord_voice_auto_join_users() == {"42"}
+        assert adapter._discord_voice_auto_join_text_channel_id(SimpleNamespace(id=111)) == 123
+        assert adapter._discord_voice_channel_allowed(channel) is True
+
+    @pytest.mark.asyncio
+    async def test_auto_join_authorized_user_links_voice_to_text_channel(self):
+        adapter = self._make_adapter()
+        adapter._voice_auto_join_attempts = {}
+        text_channel = SimpleNamespace(send=AsyncMock())
+        adapter._client.get_channel = MagicMock(return_value=text_channel)
+        adapter._is_allowed_user = MagicMock(return_value=True)
+        adapter.join_voice_channel = AsyncMock(return_value=True)
+        adapter._mark_voice_chat_enabled = MagicMock()
+        adapter._speak_auto_voice_greeting = AsyncMock(return_value=True)
+
+        def config_value(key, default=None, env_key=None):
+            values = {
+                "voice_auto_join": True,
+                "voice_auto_join_users": "42",
+                "voice_auto_join_text_channel_id": "123",
+                "voice_allowed_channel_names": "apollo-voice",
+            }
+            return values.get(key, default)
+
+        adapter._config_value = MagicMock(side_effect=config_value)
+        guild = SimpleNamespace(id=111, name="Hermes Server")
+        channel = SimpleNamespace(id=456, name="apollo-voice", guild=guild)
+        member = SimpleNamespace(id=42, display_name="Az", guild=guild)
+
+        result = await adapter._maybe_auto_join_voice_channel(member, channel)
+
+        assert result is True
+        adapter.join_voice_channel.assert_awaited_once()
+        _, kwargs = adapter.join_voice_channel.await_args
+        assert kwargs["text_channel_id"] == 123
+        assert kwargs["source"]["chat_id"] == "123"
+        assert kwargs["source"]["user_id"] == "42"
+        adapter._mark_voice_chat_enabled.assert_called_once_with("123")
+        adapter._speak_auto_voice_greeting.assert_awaited_once_with(111)
+        text_channel.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_auto_join_ignores_unconfigured_channel(self):
+        adapter = self._make_adapter()
+        adapter._voice_auto_join_attempts = {}
+        adapter._client.get_channel = MagicMock()
+        adapter._is_allowed_user = MagicMock(return_value=True)
+        adapter.join_voice_channel = AsyncMock(return_value=True)
+
+        def config_value(key, default=None, env_key=None):
+            values = {
+                "voice_auto_join": True,
+                "voice_auto_join_users": "42",
+                "voice_auto_join_text_channel_id": "123",
+                "voice_allowed_channel_names": "apollo-voice",
+            }
+            return values.get(key, default)
+
+        adapter._config_value = MagicMock(side_effect=config_value)
+        guild = SimpleNamespace(id=111, name="Hermes Server")
+        channel = SimpleNamespace(id=789, name="other-voice", guild=guild)
+        member = SimpleNamespace(id=42, display_name="Az", guild=guild)
+
+        result = await adapter._maybe_auto_join_voice_channel(member, channel)
+
+        assert result is False
+        adapter.join_voice_channel.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_auto_join_current_voice_members_scans_configured_channel_after_restart(self):
+        adapter = self._make_adapter()
+        guild = SimpleNamespace(id=111, name="Hermes Server")
+        member = SimpleNamespace(id=42, display_name="Az", bot=False, guild=guild)
+        channel = SimpleNamespace(id=456, name="apollo-voice", guild=guild, members=[member])
+        guild.voice_channels = [channel]
+        adapter._client.guilds = [guild]
+        adapter._client.user = SimpleNamespace(id=999)
+        adapter._discord_voice_auto_join_enabled = MagicMock(return_value=True)
+        adapter._discord_voice_channel_allowed = MagicMock(return_value=True)
+        adapter._maybe_auto_join_voice_channel = AsyncMock(return_value=True)
+
+        await adapter._auto_join_current_voice_members()
+
+        adapter._maybe_auto_join_voice_channel.assert_awaited_once_with(member, channel)
+
+    @pytest.mark.asyncio
+    async def test_auto_leave_defers_disconnect_to_inactivity_timeout_after_channel_empties(self):
+        adapter = self._make_adapter()
+        guild = SimpleNamespace(id=111, name="Hermes Server")
+        channel = SimpleNamespace(id=456, name="apollo-voice", guild=guild, members=[])
+        adapter._voice_clients = {
+            111: SimpleNamespace(channel=SimpleNamespace(id=456))
+        }
+        adapter.is_in_voice_channel = MagicMock(return_value=True)
+        adapter.leave_voice_channel = AsyncMock(return_value=True)
+        adapter._reset_voice_timeout = MagicMock()
+
+        def config_value(key, default=None, env_key=None):
+            values = {
+                "voice_auto_join": True,
+                "voice_auto_join_users": "42",
+                "voice_allowed_channel_names": "apollo-voice",
+            }
+            return values.get(key, default)
+
+        adapter._config_value = MagicMock(side_effect=config_value)
+        member = SimpleNamespace(id=42, display_name="Az", guild=guild)
+
+        result = await adapter._maybe_auto_leave_voice_channel(member, channel)
+
+        assert result is False
+        adapter.leave_voice_channel.assert_not_awaited()
+        adapter._reset_voice_timeout.assert_called_once_with(111)
+
+    @pytest.mark.asyncio
+    async def test_auto_leave_keeps_voice_connected_when_authorized_user_remains(self):
+        adapter = self._make_adapter()
+        guild = SimpleNamespace(id=111, name="Hermes Server")
+        remaining = SimpleNamespace(id=42, display_name="Az", bot=False, guild=guild)
+        channel = SimpleNamespace(id=456, name="apollo-voice", guild=guild, members=[remaining])
+        adapter._voice_clients = {
+            111: SimpleNamespace(channel=SimpleNamespace(id=456))
+        }
+        adapter.is_in_voice_channel = MagicMock(return_value=True)
+        adapter.leave_voice_channel = AsyncMock(return_value=True)
+        adapter._is_allowed_user = MagicMock(return_value=True)
+
+        def config_value(key, default=None, env_key=None):
+            values = {
+                "voice_auto_join": True,
+                "voice_auto_join_users": "42",
+                "voice_allowed_channel_names": "apollo-voice",
+            }
+            return values.get(key, default)
+
+        adapter._config_value = MagicMock(side_effect=config_value)
+
+        result = await adapter._maybe_auto_leave_voice_channel(remaining, channel)
+
+        assert result is False
+        adapter.leave_voice_channel.assert_not_awaited()
+
+    def test_voice_join_greeting_silent_channels_default_empty(self):
+        """No config -> empty silent-channels set (upstream greet-everywhere behavior)."""
+        adapter = self._make_adapter()
+        adapter._config_value = MagicMock(return_value=None)
+        assert adapter._discord_voice_join_greeting_silent_channels() == set()
+
+    def test_voice_join_greeting_silent_channels_parses_list(self):
+        """List config -> lowercased set of channel names to keep silent."""
+        adapter = self._make_adapter()
+        adapter._config_value = MagicMock(return_value=["bredren-voice", "council"])
+        assert adapter._discord_voice_join_greeting_silent_channels() == {"bredren-voice", "council"}
+
+    def test_voice_join_greeting_silent_channels_parses_comma_string(self):
+        """Comma-separated string config -> same normalised set."""
+        adapter = self._make_adapter()
+        adapter._config_value = MagicMock(return_value="Bredren-Voice, Council ")
+        assert adapter._discord_voice_join_greeting_silent_channels() == {"bredren-voice", "council"}
+
+    # ── Bumba voice packets ported onto the unified adapter (G1-B, 2026-09-14) ──
+
+    _BUMBA_GUILD = "1476645829790929020"
+    _BUMBA_VOICE = "1534095282114002964"
+    _BUMBA_TEXT = "1476645830898483345"
+    _BUMBA_USER = "1003486059386130463"
+
+    def _bumba_config_as_config_set_strings(self):
+        """The exact shapes ``hermes config set`` left in Bumba's profile."""
+        return {
+            "voice_auto_join": "true",
+            "voice_auto_join_users": '["%s"]' % self._BUMBA_USER,
+            "voice_auto_join_text_channel_id": '{"%s":"%s"}' % (self._BUMBA_GUILD, self._BUMBA_TEXT),
+            "voice_allowed_channel_ids": '{"%s":["%s"]}' % (self._BUMBA_GUILD, self._BUMBA_VOICE),
+            "voice_allowed_channel_names": "bumba-voice",
+            "voice_denied_channel_names": "marcion-voice,muse-voice,achilles-voice,apollo-voice,bredren-voice",
+            "voice_namesake_greeting_enabled": "true",
+            "voice_namesake_greeting_channel_ids": '["%s"]' % self._BUMBA_VOICE,
+            "voice_namesake_greeting_message": "Hello, Bumba here. How can I help?",
+            "voice_empty_channel_timeout_seconds": "30",
+        }
+
+    def _bumba_channel(self, channel_id, name, guild_id=None):
+        guild = SimpleNamespace(id=int(guild_id or self._BUMBA_GUILD), name="BREDREN")
+        return SimpleNamespace(id=int(channel_id), name=name, guild=guild)
+
+    def test_bumba_config_set_strings_resolve_per_guild_map(self):
+        adapter = self._make_adapter()
+        adapter.config.extra = self._bumba_config_as_config_set_strings()
+
+        assert adapter._discord_voice_auto_join_enabled() is True
+        assert adapter._discord_voice_auto_join_users() == {self._BUMBA_USER}
+        guild = SimpleNamespace(id=int(self._BUMBA_GUILD))
+        assert adapter._discord_voice_auto_join_text_channel_id(guild) == int(self._BUMBA_TEXT)
+        assert adapter._discord_voice_config_set("voice_allowed_channel_ids") == {self._BUMBA_VOICE}
+        assert adapter._discord_voice_config_set(
+            "voice_allowed_channel_ids", guild_id=self._BUMBA_GUILD
+        ) == {self._BUMBA_VOICE}
+        assert adapter._discord_voice_config_set(
+            "voice_allowed_channel_ids", guild_id="999"
+        ) == set()
+        assert adapter._discord_voice_channel_allowed(
+            self._bumba_channel(self._BUMBA_VOICE, "bumba-voice")
+        ) is True
+        assert adapter._discord_voice_channel_allowed(
+            self._bumba_channel("1476645830898483346", "bredren-voice")
+        ) is False
+        # Same channel id in another guild is not covered by the per-guild map
+        # (the name allowlist still applies fleet-wide, so use a foreign name).
+        assert adapter._discord_voice_channel_allowed(
+            self._bumba_channel(self._BUMBA_VOICE, "other-voice", guild_id="999")
+        ) is False
+
+    def test_bumba_config_real_dict_and_list_shapes_resolve_the_same(self):
+        adapter = self._make_adapter()
+        adapter.config.extra = {
+            "voice_auto_join": True,
+            "voice_auto_join_users": [self._BUMBA_USER],
+            "voice_auto_join_text_channel_id": {self._BUMBA_GUILD: self._BUMBA_TEXT},
+            "voice_allowed_channel_ids": {self._BUMBA_GUILD: [self._BUMBA_VOICE]},
+        }
+        guild = SimpleNamespace(id=int(self._BUMBA_GUILD))
+        assert adapter._discord_voice_auto_join_users() == {self._BUMBA_USER}
+        assert adapter._discord_voice_auto_join_text_channel_id(guild) == int(self._BUMBA_TEXT)
+        assert adapter._discord_voice_channel_allowed(
+            self._bumba_channel(self._BUMBA_VOICE, "bumba-voice")
+        ) is True
+
+    def test_flat_list_allowed_channel_ids_still_allow_any_guild(self):
+        """apollo/marcion/muse shape: a flat list applies to every guild."""
+        adapter = self._make_adapter()
+        adapter.config.extra = {
+            "voice_allowed_channel_ids": ["111", "222"],
+            "voice_denied_channel_ids": "333",
+        }
+        assert adapter._discord_voice_channel_allowed(self._bumba_channel("111", "apollo-voice")) is True
+        assert adapter._discord_voice_channel_allowed(self._bumba_channel("111", "apollo-voice", guild_id="7")) is True
+        assert adapter._discord_voice_channel_allowed(self._bumba_channel("333", "apollo-voice")) is False
+        assert adapter._discord_voice_channel_allowed(self._bumba_channel("444", "apollo-voice")) is False
+
+    def test_bumba_empty_channel_timeout_drives_scheduler(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+        from gateway.config import PlatformConfig
+
+        with patch("hermes_cli.config.read_raw_config", return_value={
+            "discord": {"voice_empty_channel_timeout_seconds": 30}
+        }):
+            adapter = DiscordAdapter(PlatformConfig(enabled=True, token="x"))
+
+        assert adapter._voice_timeout_seconds == 30
+        assert adapter._voice_timeout_limit() == 30
+
+    def test_empty_channel_timeout_from_extra_wins_over_inactivity_key(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+        from gateway.config import PlatformConfig
+
+        with patch("hermes_cli.config.read_raw_config", return_value={
+            "discord": {"voice_channel_inactivity_timeout_seconds": 600}
+        }):
+            adapter = DiscordAdapter(PlatformConfig(
+                enabled=True, token="x", extra={"voice_empty_channel_timeout_seconds": "45"}
+            ))
+
+        assert adapter._voice_timeout_seconds == 45
+
+    @pytest.mark.asyncio
+    async def test_bumba_approved_user_leave_schedules_timeout_even_with_stale_members(self):
+        adapter = self._make_adapter()
+        adapter.config.extra = {"voice_auto_join_users": self._BUMBA_USER}
+        adapter._client = MagicMock(user=MagicMock(id=999))
+        adapter._reset_voice_timeout = MagicMock()
+        adapter._cancel_voice_timeout = MagicMock()
+
+        channel = self._bumba_channel(self._BUMBA_VOICE, "bumba-voice")
+        tracked_member = SimpleNamespace(id=int(self._BUMBA_USER), bot=False)
+        # discord.py can present stale channel.members during the leave event.
+        channel.members = [tracked_member, adapter._client.user]
+        adapter._voice_clients[int(self._BUMBA_GUILD)] = MagicMock(channel=channel)
+
+        member = SimpleNamespace(id=int(self._BUMBA_USER), guild=channel.guild, bot=False)
+        await adapter._handle_tracked_user_voice_state(
+            member, SimpleNamespace(channel=channel), SimpleNamespace(channel=None)
+        )
+
+        adapter._reset_voice_timeout.assert_called_once_with(int(self._BUMBA_GUILD))
+        adapter._cancel_voice_timeout.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_bumba_approved_user_join_cancels_timeout(self):
+        adapter = self._make_adapter()
+        adapter.config.extra = {"voice_auto_join_users": [self._BUMBA_USER]}
+        adapter._client = MagicMock(user=MagicMock(id=999))
+        adapter._reset_voice_timeout = MagicMock()
+        adapter._cancel_voice_timeout = MagicMock()
+
+        channel = self._bumba_channel(self._BUMBA_VOICE, "bumba-voice")
+        channel.members = []
+        adapter._voice_clients[int(self._BUMBA_GUILD)] = MagicMock(channel=channel)
+        member = SimpleNamespace(id=int(self._BUMBA_USER), guild=channel.guild, bot=False)
+
+        await adapter._handle_tracked_user_voice_state(
+            member, SimpleNamespace(channel=None), SimpleNamespace(channel=channel)
+        )
+
+        adapter._cancel_voice_timeout.assert_called_once_with(int(self._BUMBA_GUILD))
+        adapter._reset_voice_timeout.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_untracked_user_voice_state_is_ignored(self):
+        adapter = self._make_adapter()
+        adapter.config.extra = {"voice_auto_join_users": [self._BUMBA_USER]}
+        adapter._reset_voice_timeout = MagicMock()
+        adapter._cancel_voice_timeout = MagicMock()
+        channel = self._bumba_channel(self._BUMBA_VOICE, "bumba-voice")
+        adapter._voice_clients[int(self._BUMBA_GUILD)] = MagicMock(channel=channel)
+        stranger = SimpleNamespace(id=42, guild=channel.guild, bot=False)
+
+        await adapter._handle_tracked_user_voice_state(
+            stranger, SimpleNamespace(channel=channel), SimpleNamespace(channel=None)
+        )
+
+        adapter._reset_voice_timeout.assert_not_called()
+        adapter._cancel_voice_timeout.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_bumba_timeout_handler_rearms_while_human_present(self):
+        adapter = self._make_adapter()
+        adapter._client = MagicMock(user=MagicMock(id=999))
+        channel = self._bumba_channel(self._BUMBA_VOICE, "bumba-voice")
+        channel.members = [SimpleNamespace(id=int(self._BUMBA_USER), bot=False), SimpleNamespace(id=999, bot=True)]
+        vc = MagicMock(channel=channel)
+        vc.is_connected.return_value = True
+        adapter._voice_clients[int(self._BUMBA_GUILD)] = vc
+        adapter.leave_voice_channel = AsyncMock()
+        adapter._reset_voice_timeout = MagicMock()
+        adapter._on_voice_disconnect = None
+
+        assert adapter._bumba_voice_channel_has_human(int(self._BUMBA_GUILD)) is True
+        with patch("asyncio.sleep", new=AsyncMock()):
+            await adapter._voice_timeout_handler(int(self._BUMBA_GUILD), 30)
+
+        adapter.leave_voice_channel.assert_not_awaited()
+        adapter._reset_voice_timeout.assert_called_once_with(int(self._BUMBA_GUILD))
+
+    @pytest.mark.asyncio
+    async def test_bumba_timeout_handler_leaves_empty_channel(self):
+        adapter = self._make_adapter()
+        adapter._client = MagicMock(user=MagicMock(id=999))
+        adapter._client.get_channel.return_value = None
+        channel = self._bumba_channel(self._BUMBA_VOICE, "bumba-voice")
+        channel.members = [SimpleNamespace(id=999, bot=True)]
+        vc = MagicMock(channel=channel)
+        vc.is_connected.return_value = True
+        adapter._voice_clients[int(self._BUMBA_GUILD)] = vc
+        adapter.leave_voice_channel = AsyncMock()
+        adapter._on_voice_disconnect = None
+
+        assert adapter._bumba_voice_channel_has_human(int(self._BUMBA_GUILD)) is False
+        with patch("asyncio.sleep", new=AsyncMock()):
+            await adapter._voice_timeout_handler(int(self._BUMBA_GUILD), 30)
+
+        adapter.leave_voice_channel.assert_awaited_once_with(int(self._BUMBA_GUILD))
+
+    @pytest.mark.asyncio
+    async def test_auto_leave_ignores_stale_leaving_member_in_channel_members(self):
+        adapter = self._make_adapter()
+        adapter.config.extra = {
+            "voice_auto_join": True,
+            "voice_auto_join_users": [self._BUMBA_USER],
+            "voice_empty_channel_timeout_seconds": 30,
+        }
+        adapter._is_allowed_user = MagicMock(return_value=True)
+        channel = self._bumba_channel(self._BUMBA_VOICE, "bumba-voice")
+        member = SimpleNamespace(id=int(self._BUMBA_USER), guild=channel.guild, bot=False)
+        channel.members = [member]  # stale: discord.py still lists the leaver
+        vc = MagicMock(channel=channel)
+        vc.is_connected.return_value = True
+        adapter._voice_clients[int(self._BUMBA_GUILD)] = vc
+
+        with patch("asyncio.create_task") as create_task:
+            scheduled = await adapter._maybe_auto_leave_voice_channel(member, channel)
+            create_task.return_value = None
+        assert scheduled is True
+
+    def test_join_voice_channel_persists_binding_via_bumba_hook(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = self._make_adapter()
+        adapter._bumba_persist_voice_binding(int(self._BUMBA_GUILD), int(self._BUMBA_VOICE), int(self._BUMBA_TEXT))
+        data = json.loads((tmp_path / "state" / "voice_bindings.json").read_text())
+        assert data["bindings"] == [{
+            "guild_id": self._BUMBA_GUILD,
+            "voice_channel_id": self._BUMBA_VOICE,
+            "text_channel_id": self._BUMBA_TEXT,
+        }]
+
+    def test_namesake_greeting_used_when_join_greeting_text_is_empty(self):
+        adapter = self._make_adapter()
+        adapter.config.extra = self._bumba_config_as_config_set_strings()
+        channel = self._bumba_channel(self._BUMBA_VOICE, "bumba-voice")
+        adapter._voice_clients[int(self._BUMBA_GUILD)] = MagicMock(channel=channel, guild=channel.guild)
+
+        assert adapter._discord_voice_greeting_text(int(self._BUMBA_GUILD)) == "Hello, Bumba here. How can I help?"
+
+    def test_namesake_greeting_silent_outside_namesake_channel(self):
+        adapter = self._make_adapter()
+        adapter.config.extra = self._bumba_config_as_config_set_strings()
+        channel = self._bumba_channel("1476645830898483346", "bredren-voice")
+        adapter._voice_clients[int(self._BUMBA_GUILD)] = MagicMock(channel=channel, guild=channel.guild)
+
+        assert adapter._discord_voice_greeting_text(int(self._BUMBA_GUILD)) == ""
+
+    def test_join_greeting_text_wins_over_namesake_message(self):
+        adapter = self._make_adapter()
+        extra = self._bumba_config_as_config_set_strings()
+        extra["voice_join_greeting_text"] = "Apollo online."
+        adapter.config.extra = extra
+        adapter._voice_clients[int(self._BUMBA_GUILD)] = MagicMock()
+
+        assert adapter._discord_voice_greeting_text(int(self._BUMBA_GUILD)) == "Apollo online."
 
     @pytest.mark.asyncio
     async def test_playback_timeout_scales_with_audio_duration(self):
@@ -837,6 +1291,7 @@ class TestCallbackWiringOrder:
 
         mock_channel = MagicMock()
         mock_channel.name = "General"
+        mock_channel.id = int(os.environ.get("DISCORD_ALLOWED_VOICE_CHANNELS", "1536632245412958228").split(",")[0])
         mock_adapter = AsyncMock()
         mock_adapter.join_voice_channel = AsyncMock(
             side_effect=RuntimeError("No permission")

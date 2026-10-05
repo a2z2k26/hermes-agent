@@ -278,11 +278,17 @@ class DiscordMediaMixin:
         self, chat_id: str, audio_path: str, caption: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs,
     ) -> SendResult:
-        """Send audio as a Discord file attachment."""
+        """Send audio as a Discord file attachment or play it in a bound VC."""
         from plugins.platforms.discord.adapter import _prompt_target_id, discord
 
         try:
             import io
+            # Fleet 9adb7baadf: a text chat bound to a live VC gets the audio played in the VC.
+            for gid, text_ch_id in getattr(self, "_voice_text_channels", {}).items():
+                if str(text_ch_id) == str(chat_id) and self.is_in_voice_channel(gid):
+                    logger.info("[%s] Playing outbound audio in voice channel (guild=%d)", self.name, gid)
+                    success = await self.play_in_voice_channel(gid, audio_path)
+                    return SendResult(success=bool(success))
             channel = await self._resolve_channel(_prompt_target_id(chat_id, metadata))
             if not channel:
                 return SendResult(success=False, error=f"Channel {chat_id} not found")

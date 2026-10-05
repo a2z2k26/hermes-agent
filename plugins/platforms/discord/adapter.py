@@ -402,10 +402,23 @@ def _load_opus_codec() -> None:
     if opus_path:
         opus_candidates.append(opus_path)
     elif sys.platform == "darwin":
-        for _hp in ("/opt/homebrew/lib/libopus.dylib", "/usr/local/lib/libopus.dylib"):  # Apple Silicon, Intel
+        for _hp in (
+            "/opt/homebrew/lib/libopus.dylib",  # Apple Silicon
+            "/usr/local/lib/libopus.dylib",     # Intel Mac
+            os.path.expanduser("~/.local/lib/libopus.dylib"),  # user-local/source build (fleet: muse)
+        ):
             if os.path.isfile(_hp):
                 opus_candidates.append(_hp)
                 break
+        # Last resort on macOS: the libopus that PyAV ships inside the venv (every fleet host has it).
+        # Fleet 466e28c897.
+        try:
+            import av as _av  # noqa: F401
+            _av_opus = os.path.join(os.path.dirname(_av.__file__), ".dylibs", "libopus.0.dylib")
+            if os.path.isfile(_av_opus):
+                opus_candidates.append(_av_opus)
+        except Exception:
+            pass
     for opus_path in opus_candidates:
         try:
             discord.opus.load_opus(opus_path)
@@ -973,6 +986,25 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw in {"true", "1", "yes", "on"}
 
 
+def _voice_config_jsonish(value: Any) -> Any:
+    """Decode a voice config value that ``hermes config set`` stored as JSON text.
+
+    Bumba's profile (fleet packet 2026-08-21) stores per-guild maps and lists
+    as strings, e.g. ``'{"<guild>": ["<channel>"]}'`` or ``'["<user>"]'``.
+    Apollo/Marcion/Muse store real YAML lists. Both shapes must resolve to the
+    same structures, so any string that looks like a JSON object/array is
+    decoded here; anything else is returned untouched (CSV strings included).
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        if text[:1] in ("{", "["):
+            try:
+                return json.loads(text)
+            except (TypeError, ValueError):
+                return value
+    return value
+
+
 def _read_discord_prompt_timeout() -> int:
     """Timeout (seconds) for Discord button views from ``approvals.discord_prompt_timeout``
     (default 300), clamped to [MIN, MAX] so a typo can't make prompts vanish or outlive tokens."""
@@ -1037,6 +1069,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self.gateway_runner = None  # Set by gateway/run.py for cross-platform delivery
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
         self._voice_locks: Dict[int, asyncio.Lock] = {}  # guild_id -> serialize join/leave
+        # Auto-join throttle: guild_id -> last attempt monotonic timestamp.
+        # This is opt-in and only triggers for explicitly authorized users.
+        self._voice_auto_join_attempts: Dict[int, float] = {}
         # Text batching: merge rapid successive messages (Telegram-style)
         self._text_batch_delay_seconds = env_float("HERMES_DISCORD_TEXT_BATCH_DELAY_SECONDS", 0.6)
         self._text_batch_split_delay_seconds = env_float("HERMES_DISCORD_TEXT_BATCH_SPLIT_DELAY_SECONDS", 2.0)
@@ -1329,15 +1364,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
             @self._client.event
             async def on_voice_state_update(member, before, after):
-                """Track voice channel join/leave events."""
-                bot_guild_ids = set(adapter_self._voice_clients.keys())
-                if not bot_guild_ids:
-                    return
-                guild_id = member.guild.id
-                if guild_id not in bot_guild_ids:
-                    return
+                """Track voice channel join/leave events and optional auto-join."""
+                # Ignore the bot itself
                 if member == adapter_self._client.user:
                     return
+
+                guild_id = member.guild.id
                 joined = before.channel is None and after.channel is not None
                 left = before.channel is not None and after.channel is None
                 switched = (
@@ -1345,6 +1377,21 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     and after.channel is not None
                     and before.channel != after.channel
                 )
+
+                if (joined or switched) and after.channel is not None:
+                    await adapter_self._maybe_auto_join_voice_channel(member, after.channel)
+                if (left or switched) and before.channel is not None:
+                    await adapter_self._maybe_auto_leave_voice_channel(member, before.channel)
+                await adapter_self._handle_tracked_user_voice_state(member, before, after)
+
+                # Only track channel awareness logs for guilds where the bot is connected.
+                bot_guild_ids = set(adapter_self._voice_clients.keys())
+                if not bot_guild_ids:
+                    return
+                guild_id = member.guild.id
+                if guild_id not in bot_guild_ids:
+                    return
+
                 if joined or left or switched:
                     logger.info(
                         "Voice state: %s (%d) %s (guild %d)",
@@ -1371,6 +1418,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             # startup failure reported as ``fatal`` for the life of the process (#102554).
             self._mark_connected()
             self._start_liveness_probe()
+            self._log_voice_policy_summary()
+            asyncio.create_task(self._reconcile_voice_auto_join_on_ready())
             # Plugin-registered native handlers (discord.py Bot — add_listener()/event hooks).
             self._wire_plugin_handlers(self._client)
             return True
@@ -2111,6 +2160,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         """Finish non-critical startup work after Discord is connected."""
         if not self._client:
             return
+        await self._auto_join_current_voice_members()
         try:
             sync_policy = self._get_discord_command_sync_policy()
             if sync_policy == "off":
@@ -3384,7 +3434,29 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return default
 
     def _load_voice_timeout(self) -> int:
-        """Return voice-channel inactivity timeout seconds; 0 disables it."""
+        """Return voice-channel timeout seconds; 0 disables it.
+
+        Bumba packet (2026-08-21): the fleet contract's explicit
+        ``voice_empty_channel_timeout_seconds`` drives the scheduler when it
+        is set, so ``_voice_timeout_limit()`` and the startup policy log
+        resolve the same number. The legacy inactivity key stays the
+        fallback. The timer only disconnects an empty channel (see
+        ``_bumba_voice_channel_has_human``), so a short value is safe.
+        """
+        raw = self._config_value("voice_empty_channel_timeout_seconds", None)
+        if raw is None:
+            try:
+                from hermes_cli.config import read_raw_config
+                cfg = read_raw_config() or {}
+                raw = (cfg.get("discord") or {}).get("voice_empty_channel_timeout_seconds")
+            except Exception as e:
+                logger.debug("Could not load discord.voice_empty_channel_timeout_seconds: %s", e)
+                raw = None
+        if raw is not None and raw != "":
+            try:
+                return max(0, int(raw))
+            except (TypeError, ValueError):
+                logger.warning("Ignoring invalid discord.voice_empty_channel_timeout_seconds: %r", raw)
         return self._load_discord_int_config(
             "voice_channel_inactivity_timeout_seconds", self.VOICE_TIMEOUT, minimum=0,
         )
@@ -3394,6 +3466,562 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         return self._load_discord_int_config(
             "voice_playback_timeout_seconds", self.PLAYBACK_TIMEOUT, minimum=1,
         )
+
+    async def _auto_join_current_voice_members(self) -> None:
+        """On startup/reconnect, join if an authorized user is already in VC."""
+        if not self._client or not self._discord_voice_auto_join_enabled():
+            return
+        for guild in getattr(self._client, "guilds", []) or []:
+            if getattr(guild, "id", None) in self._voice_clients:
+                continue
+            for channel in getattr(guild, "voice_channels", []) or []:
+                if not self._discord_voice_channel_allowed(channel):
+                    continue
+                for member in getattr(channel, "members", []) or []:
+                    if getattr(member, "bot", False):
+                        continue
+                    if getattr(getattr(self._client, "user", None), "id", None) == getattr(member, "id", None):
+                        continue
+                    try:
+                        joined = await self._maybe_auto_join_voice_channel(member, channel)
+                    except Exception as exc:
+                        logger.warning(
+                            "Voice auto-join startup scan failed for guild=%s channel=%s: %s",
+                            getattr(guild, "id", "?"),
+                            getattr(channel, "id", "?"),
+                            exc,
+                        )
+                        joined = False
+                    if joined:
+                        break
+                if getattr(guild, "id", None) in self._voice_clients:
+                    break
+
+    async def _maybe_auto_join_voice_channel(self, member, channel) -> bool:
+        """Opt-in: join an authorized user's Discord voice channel on join/switch.
+
+        The linked text channel is used for transcript echo, normal agent
+        routing, and spoken TTS replies. This remains off unless explicitly
+        configured because voice channels are sensitive in shared servers.
+        """
+        if channel is None or not self._discord_voice_auto_join_enabled():
+            return False
+        if not self._discord_voice_channel_allowed(channel):
+            logger.info(
+                "Voice auto-join refused for disallowed channel %s (%s)",
+                getattr(channel, "name", getattr(channel, "id", "?")),
+                getattr(channel, "id", "?"),
+            )
+            return False
+        guild = getattr(member, "guild", None)
+        guild_id = getattr(guild, "id", None)
+        if guild_id is None:
+            return False
+
+        user_id = str(getattr(member, "id", ""))
+        if not user_id:
+            return False
+
+        allowed_auto_users = self._discord_voice_auto_join_users()
+        if allowed_auto_users and "*" not in allowed_auto_users and user_id not in allowed_auto_users:
+            return False
+        if not self._is_allowed_user(user_id, author=member, guild=guild, is_dm=False):
+            logger.debug("Voice auto-join ignored unauthorized user %s", user_id)
+            return False
+
+        now = time.monotonic()
+        last_attempt = self._voice_auto_join_attempts.get(int(guild_id), 0.0)
+        if now - last_attempt < 10.0:
+            return False
+        self._voice_auto_join_attempts[int(guild_id)] = now
+
+        text_channel_id = self._discord_voice_auto_join_text_channel_id(guild)
+        if text_channel_id is None:
+            logger.warning(
+                "Voice auto-join is enabled but no text channel is configured for guild %s",
+                guild_id,
+            )
+            return False
+
+        text_channel = self._client.get_channel(text_channel_id) if self._client else None
+        chat_name = None
+        if guild is not None and text_channel is not None:
+            chat_name = f"{getattr(guild, 'name', guild_id)} / #{getattr(text_channel, 'name', text_channel_id)}"
+
+        source = {
+            "platform": Platform.DISCORD.value,
+            "chat_id": str(text_channel_id),
+            "user_id": user_id,
+            "user_name": getattr(member, "display_name", user_id),
+            "chat_type": "channel",
+            "chat_name": chat_name,
+        }
+        try:
+            success = await self.join_voice_channel(
+                channel,
+                text_channel_id=text_channel_id,
+                source=source,
+            )
+        except Exception as e:
+            logger.warning("Voice auto-join failed for guild=%s channel=%s: %s", guild_id, getattr(channel, "id", "?"), e)
+            return False
+        if not success:
+            logger.warning("Voice auto-join failed for guild=%s channel=%s", guild_id, getattr(channel, "id", "?"))
+            return False
+
+        self._mark_voice_chat_enabled(str(text_channel_id))
+        self._persist_voice_binding(int(guild_id), int(getattr(channel, "id", 0) or 0), text_channel_id)
+        logger.info(
+            "Voice auto-joined %s (%s) for user %s; linked text channel %s",
+            getattr(channel, "name", getattr(channel, "id", "?")),
+            getattr(channel, "id", "?"),
+            user_id,
+            text_channel_id,
+        )
+        if text_channel is not None:
+            with suppress(Exception):
+                await text_channel.send(
+                    f"Joined voice channel **{getattr(channel, 'name', 'voice')}**. "
+                    "I'll speak my replies and listen. Use /voice leave to disconnect."
+                )
+        # Shared voice rooms (e.g. bredren-voice) should remain silent on join
+        # even when a greeting is configured. Marcion should not step on other
+        # agents' turns in council-style rooms. Gate the greeting on a
+        # per-channel silent-list before invoking upstream's speaker.
+        channel_name = str(getattr(channel, "name", "") or "").strip().lower()
+        if channel_name in self._discord_voice_join_greeting_silent_channels():
+            logger.info(
+                "Voice greeting suppressed: channel=%s is in voice_join_greeting_silent_channels",
+                channel_name,
+            )
+        else:
+            await self._speak_auto_voice_greeting(int(guild_id))
+        return True
+
+    def _discord_voice_auto_join_enabled(self) -> bool:
+        value = self._config_value(
+            "voice_auto_join",
+            None,
+            env_key="DISCORD_VOICE_AUTO_JOIN",
+        )
+        if value is None:
+            return False
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"true", "1", "yes", "on"}
+
+    def _discord_voice_auto_join_users(self) -> set[str]:
+        value = _voice_config_jsonish(self._config_value(
+            "voice_auto_join_users",
+            None,
+            env_key="DISCORD_VOICE_AUTO_JOIN_USERS",
+        ))
+        if value is None:
+            return set()
+        if isinstance(value, (list, tuple, set)):
+            return {str(item).strip() for item in value if str(item).strip()}
+        return {part.strip() for part in str(value).split(",") if part.strip()}
+
+    def _discord_voice_auto_join_text_channel_id(self, guild) -> Optional[int]:
+        guild_id = str(getattr(guild, "id", "") or "")
+        configured = _voice_config_jsonish(self._config_value(
+            "voice_auto_join_text_channel_id",
+            None,
+            env_key="DISCORD_VOICE_AUTO_JOIN_TEXT_CHANNEL_ID",
+        ))
+        if isinstance(configured, dict):
+            if guild_id in configured:
+                configured = configured.get(guild_id)
+                if not configured:
+                    return None
+            else:
+                configured = configured.get("*")
+        if configured:
+            try:
+                return int(str(configured).strip())
+            except (TypeError, ValueError):
+                logger.warning("Ignoring invalid Discord voice auto-join text channel id: %r", configured)
+
+        home_channel = getattr(self.config, "home_channel", None)
+        home_chat_id = getattr(home_channel, "chat_id", None)
+        if home_chat_id:
+            try:
+                return int(str(home_chat_id).strip())
+            except (TypeError, ValueError):
+                pass
+
+        env_home = os.getenv("DISCORD_HOME_CHANNEL", "").strip()
+        if env_home:
+            try:
+                return int(env_home)
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    def _discord_voice_config_set(
+        self,
+        key: str,
+        *,
+        env_key: Optional[str] = None,
+        guild_id: Optional[Any] = None,
+    ) -> set[str]:
+        """Resolve a voice allow/deny key to a lowercase set of ids or names.
+
+        Accepts every shape the fleet uses for the same key:
+          - flat list / tuple / set (apollo, marcion, muse YAML lists);
+          - comma-separated string (env vars, ``voice_denied_channel_names``);
+          - per-guild map ``{guild_id: [ids...]}`` (bumba), as a real dict or
+            as the JSON text ``hermes config set`` stores.
+        With ``guild_id`` a per-guild map yields only that guild's entries plus
+        any ``"*"`` entries; without it the map is flattened (policy logging).
+        """
+        value = _voice_config_jsonish(self._config_value(key, None, env_key=env_key))
+        if value is None:
+            return set()
+        if isinstance(value, dict):
+            items = []
+            if guild_id is None:
+                scoped = list(value.values())
+            else:
+                scoped = [value.get(str(guild_id)), value.get("*")]
+            for maybe_items in scoped:
+                if isinstance(maybe_items, (list, tuple, set)):
+                    items.extend(maybe_items)
+                elif maybe_items:
+                    items.extend(str(maybe_items).split(","))
+            return {str(item).strip().lower() for item in items if str(item).strip()}
+        if isinstance(value, (list, tuple, set)):
+            return {str(item).strip().lower() for item in value if str(item).strip()}
+        return {part.strip().lower() for part in str(value).split(",") if part.strip()}
+
+    def _discord_voice_channel_allowed(self, channel) -> bool:
+        """Apply Discord voice channel allow/deny policy before joining."""
+        channel_id = str(getattr(channel, "id", "") or "")
+        channel_name = str(getattr(channel, "name", "") or "").strip().lower()
+        guild_id = getattr(getattr(channel, "guild", None), "id", None)
+        denied_ids = self._discord_voice_config_set(
+            "voice_denied_channel_ids",
+            env_key="DISCORD_VOICE_DENIED_CHANNEL_IDS",
+            guild_id=guild_id,
+        )
+        denied_names = self._discord_voice_config_set(
+            "voice_denied_channel_names",
+            env_key="DISCORD_VOICE_DENIED_CHANNEL_NAMES",
+            guild_id=guild_id,
+        )
+        if channel_id.lower() in denied_ids or channel_name in denied_names:
+            return False
+
+        allowed_ids = self._discord_voice_config_set(
+            "voice_allowed_channel_ids",
+            env_key="DISCORD_VOICE_ALLOWED_CHANNEL_IDS",
+            guild_id=guild_id,
+        )
+        allowed_names = self._discord_voice_config_set(
+            "voice_allowed_channel_names",
+            env_key="DISCORD_VOICE_ALLOWED_CHANNEL_NAMES",
+            guild_id=guild_id,
+        )
+        if allowed_ids or allowed_names:
+            return channel_id.lower() in allowed_ids or channel_name in allowed_names
+        return True
+
+    # ── Ported from Muse's voice architecture (fleet unification, 2026-09-01).
+    # Three features the candidate lineage lacked, adapted to its accessors:
+    # startup policy logging (the diagnosability that would have caught the
+    # 2026-08-31 config-drift outages instantly), binding persistence, and
+    # the on-ready reconcile that makes voice recoverable after a restart
+    # (closes remediation-plan D4/APO-08). Original rationale docstrings
+    # preserved from the Muse implementation.
+
+    def _log_voice_policy_summary(self) -> None:
+        """Log the resolved voice policy at startup.
+
+        Every value is read through the SAME accessors the auto-join gates
+        use, so this reports what the gates will actually see, not what the
+        YAML says. A voice policy that failed to load is otherwise
+        indistinguishable from one that loaded and correctly declined.
+        """
+        try:
+            extra = self.config.extra if isinstance(getattr(self.config, "extra", None), dict) else {}
+            logger.info(
+                "[%s] VOICE POLICY: auto_join=%s allowed_ids=%s allowed_names=%s "
+                "denied_ids=%s denied_names=%s auto_join_users=%s greeting_text=%r "
+                "namesake_greeting_enabled=%s namesake_greeting_channel_ids=%s "
+                "empty_timeout=%s inactivity_timeout=%s timer=%s extra_keys=%d",
+                self.name,
+                self._discord_voice_auto_join_enabled(),
+                sorted(self._discord_voice_config_set("voice_allowed_channel_ids")),
+                sorted(self._discord_voice_config_set("voice_allowed_channel_names")),
+                sorted(self._discord_voice_config_set("voice_denied_channel_ids")),
+                sorted(self._discord_voice_config_set("voice_denied_channel_names")),
+                sorted(self._discord_voice_auto_join_users()),
+                str(self._config_value("voice_join_greeting_text", "") or "")[:40],
+                self._discord_voice_namesake_greeting_enabled(),
+                sorted(self._discord_voice_config_set("voice_namesake_greeting_channel_ids")),
+                self._config_value("voice_empty_channel_timeout_seconds", None),
+                self._config_value("voice_channel_inactivity_timeout_seconds", None),
+                self._voice_timeout_limit(),
+                len(extra),
+            )
+            if self._discord_voice_auto_join_enabled():
+                missing = []
+                if not (self._discord_voice_config_set("voice_allowed_channel_ids")
+                        or self._discord_voice_config_set("voice_allowed_channel_names")):
+                    missing.append("voice_allowed_channel_ids/names")
+                if not self._discord_voice_auto_join_users():
+                    missing.append("voice_auto_join_users")
+                if missing:
+                    logger.warning(
+                        "[%s] VOICE POLICY INCOMPLETE: %s empty as the gates see them; "
+                        "auto-join will silently decline. voice_* keys present: %s",
+                        self.name, missing,
+                        sorted(k for k in extra if str(k).startswith("voice_")),
+                    )
+        except Exception as exc:  # never let diagnostics break startup
+            logger.warning("[%s] VOICE POLICY: could not resolve (%s)", self.name, exc)
+
+    def _voice_bindings_path(self):
+        from pathlib import Path as _P
+        home = _P(os.environ.get("HERMES_HOME") or (_P.home() / ".hermes"))
+        return home / "state" / "voice_bindings.json"
+
+    def _persist_voice_binding(self, guild_id: int, channel_id: int, text_channel_id) -> None:
+        """Record the live voice binding to disk (atomic, best-effort).
+
+        self._voice_clients is in-memory only; this writes the binding back
+        so "which channel is the bot bound to?" is answerable from disk
+        instead of from a live object that dies with the process.
+        """
+        try:
+            import json as _json
+            from datetime import datetime as _dt, timezone as _tz
+            path = self._voice_bindings_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            existing = []
+            if path.is_file():
+                try:
+                    raw = _json.loads(path.read_text(encoding="utf-8"))
+                    existing = raw.get("bindings", []) if isinstance(raw, dict) else []
+                except Exception:
+                    existing = []
+            entry = {
+                "guild_id": str(guild_id),
+                "voice_channel_id": str(channel_id),
+                "text_channel_id": str(text_channel_id or ""),
+            }
+            kept = [b for b in existing if isinstance(b, dict) and str(b.get("guild_id")) != str(guild_id)]
+            kept.append(entry)
+            payload = {
+                "schema_version": 1,
+                "updated_at": _dt.now(_tz.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+                "bindings": sorted(kept, key=lambda b: str(b.get("guild_id"))),
+            }
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(_json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            tmp.replace(path)
+            logger.info("[%s] Voice binding persisted: guild=%s voice=%s", self.name, guild_id, channel_id)
+        except Exception as exc:  # noqa: BLE001 — never break a join over bookkeeping
+            logger.warning("[%s] Could not persist voice binding: %s", self.name, exc)
+
+    def _clear_voice_binding(self, guild_id: int) -> None:
+        """Drop one guild's persisted binding. Never deletes the file."""
+        try:
+            import json as _json
+            from datetime import datetime as _dt, timezone as _tz
+            path = self._voice_bindings_path()
+            if not path.is_file():
+                return
+            raw = _json.loads(path.read_text(encoding="utf-8"))
+            existing = raw.get("bindings", []) if isinstance(raw, dict) else []
+            kept = [b for b in existing if isinstance(b, dict) and str(b.get("guild_id")) != str(guild_id)]
+            if len(kept) == len(existing):
+                return
+            raw["bindings"] = kept
+            raw["updated_at"] = _dt.now(_tz.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(_json.dumps(raw, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            tmp.replace(path)
+            logger.info("[%s] Voice binding cleared: guild=%s", self.name, guild_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] Could not clear voice binding: %s", self.name, exc)
+
+    # ── Ported from Bumba's five voice packets (fleet unification G1-B,
+    # 2026-09-14). Bumba's live tree (9ba1400e5) carries these under the
+    # BUMBA-HARDEN banner; the fleet verifier keys on the method names.
+
+    def _bumba_persist_voice_binding(self, guild_id, voice_channel_id, text_channel_id) -> None:
+        """Bumba packet: persist the binding on EVERY join, not only auto-join.
+
+        Delegates to the Muse-ported writer so both lineages share one file
+        shape (``state/voice_bindings.json``). Best-effort: a bookkeeping
+        failure must never fail a join.
+        """
+        try:
+            self._persist_voice_binding(int(guild_id), int(voice_channel_id or 0), text_channel_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] Could not persist voice binding: %s", self.name, exc)
+
+    def _bumba_voice_channel_has_human(self, guild_id: int) -> bool:
+        """True while a non-bot member other than this bot is in the bot's channel.
+
+        Bumba packet: the fleet contract leaves ONLY when the channel is
+        empty of humans, never merely after silence. A present-but-quiet
+        human must not trigger a disconnect.
+        """
+        try:
+            vc = self._voice_clients.get(int(guild_id))
+            channel = getattr(vc, "channel", None) if vc else None
+            if not vc or not vc.is_connected() or channel is None:
+                return False
+            bot_user = getattr(self._client, "user", None) if self._client else None
+            bot_id = str(getattr(bot_user, "id", "") or "")
+            for member in getattr(channel, "members", []) or []:
+                if getattr(member, "bot", False) is True:
+                    continue
+                member_id = str(getattr(member, "id", "") or "")
+                if member_id and member_id != bot_id:
+                    return True
+            return False
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _voice_channel_has_tracked_user(self, guild_id: int) -> bool:
+        """True while an approved auto-join user is in the bot's channel."""
+        vc = self._voice_clients.get(int(guild_id))
+        channel = getattr(vc, "channel", None) if vc else None
+        tracked = self._discord_voice_auto_join_users()
+        bot_user = getattr(self._client, "user", None) if self._client else None
+        bot_id = str(getattr(bot_user, "id", "") or "")
+        for member in getattr(channel, "members", []) or []:
+            member_id = str(getattr(member, "id", "") or "")
+            if not member_id or member_id == bot_id or getattr(member, "bot", False) is True:
+                continue
+            if "*" in tracked or member_id in tracked:
+                return True
+        return False
+
+    async def _handle_tracked_user_voice_state(self, member, before, after) -> None:
+        """Keep the bot present while approved users share its voice channel.
+
+        Bumba packet: arm the empty-channel timer the moment the approved
+        user leaves or moves away, cancel it when they (re)join. The explicit
+        ``before.channel -> after.channel`` transition is trusted before
+        ``channel.members``, which discord.py can leave stale during the
+        leave event (that staleness made Bumba cancel instead of schedule).
+        """
+        user_id = str(getattr(member, "id", "") or "")
+        tracked = self._discord_voice_auto_join_users()
+        if not user_id or ("*" not in tracked and user_id not in tracked):
+            return
+        guild_id = getattr(getattr(member, "guild", None), "id", None)
+        if guild_id is None:
+            return
+        guild_id_int = int(guild_id)
+        vc = self._voice_clients.get(guild_id_int)
+        if vc is None:
+            return
+        bot_channel = getattr(vc, "channel", None)
+        before_channel = getattr(before, "channel", None)
+        after_channel = getattr(after, "channel", None)
+
+        def _same_channel(left, right) -> bool:
+            if left is None or right is None:
+                return False
+            return str(getattr(left, "id", "")) == str(getattr(right, "id", ""))
+
+        if _same_channel(before_channel, bot_channel) and not _same_channel(after_channel, bot_channel):
+            self._reset_voice_timeout(guild_id_int)
+            return
+        if _same_channel(after_channel, bot_channel):
+            self._cancel_voice_timeout(guild_id_int)
+            return
+        if self._voice_channel_has_tracked_user(guild_id_int):
+            self._cancel_voice_timeout(guild_id_int)
+            return
+        self._reset_voice_timeout(guild_id_int)
+
+    #: Delays (seconds) before each reconcile attempt after READY. Discord
+    #: populates voice-state caches from GUILD_CREATE, which can arrive around
+    #: or after READY, so a single immediate pass can observe an empty channel
+    #: and give up permanently. Retry briefly, then stop.
+    VOICE_RECONCILE_DELAYS = (0, 3, 8, 15)
+
+    async def _reconcile_voice_auto_join_on_ready(self) -> None:
+        """Auto-join an allowed user already sitting in an allowed channel.
+
+        Discord only emits on_voice_state_update for changes AFTER the bot is
+        online. If the gateway restarts while the approved human is already in
+        the channel, no join event fires — this reconcile pass is what makes
+        voice recoverable after a restart (D4/APO-08).
+        """
+        if not self._discord_voice_auto_join_enabled():
+            return
+        for attempt, delay in enumerate(self.VOICE_RECONCILE_DELAYS, start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            if self._voice_clients:
+                return  # already connected somewhere
+            if await self._reconcile_voice_auto_join_once(attempt, len(self.VOICE_RECONCILE_DELAYS)):
+                return
+        logger.info(
+            "[%s] Voice reconcile finished: no approved user present in an allowed "
+            "channel after %d attempt(s); will auto-join on the next join event.",
+            self.name, len(self.VOICE_RECONCILE_DELAYS),
+        )
+
+    async def _reconcile_voice_auto_join_once(self, attempt: int, total: int) -> bool:
+        """One reconcile pass. Returns True when a join was made."""
+        client = self._client
+        if client is None:
+            return False
+        allowed_users = self._discord_voice_auto_join_users()
+        scanned = 0
+        for guild in getattr(client, "guilds", []) or []:
+            for channel in getattr(guild, "voice_channels", []) or []:
+                if not self._discord_voice_channel_allowed(channel):
+                    continue
+                scanned += 1
+                for member in getattr(channel, "members", []) or []:
+                    if member == getattr(client, "user", None) or getattr(member, "bot", False):
+                        continue
+                    user_id = str(getattr(member, "id", ""))
+                    if allowed_users and "*" not in allowed_users and user_id not in allowed_users:
+                        continue
+                    if not self._is_allowed_user(user_id, author=member, guild=guild, is_dm=False):
+                        continue
+                    logger.info(
+                        "[%s] Reconcile: auto-joining %s (%s) for present user %s (attempt %d/%d)",
+                        self.name, getattr(channel, "name", ""), getattr(channel, "id", ""),
+                        user_id, attempt, total,
+                    )
+                    await self._maybe_auto_join_voice_channel(member, channel)
+                    return bool(self._voice_clients)
+        logger.info(
+            "[%s] Voice reconcile %d/%d: %d allowed channel(s) scanned, no approved user present",
+            self.name, attempt, total, scanned,
+        )
+        return False
+
+    def _mark_voice_chat_enabled(self, chat_id: str) -> None:
+        """Mirror voice-channel state after an automatic voice join.
+
+        Auto-join should make voice-channel input speak back in the VC, but it
+        must not turn the bound text chat into an audio/TTS channel. Persist
+        ``voice_only`` rather than ``all`` so typed Discord/DM messages remain
+        text-only while transcribed VC turns still get spoken replies.
+        """
+        runner = getattr(self, "gateway_runner", None)
+        if runner is not None:
+            try:
+                runner._voice_mode[runner._voice_key(Platform.DISCORD, str(chat_id))] = "voice_only"
+                runner._save_voice_modes()
+                runner._set_adapter_auto_tts_enabled(self, str(chat_id), enabled=True)
+            except Exception:
+                logger.debug("Failed to persist auto-joined voice mode", exc_info=True)
+        enabled_chats = getattr(self, "_auto_tts_enabled_chats", None)
+        if isinstance(enabled_chats, set):
+            enabled_chats.add(str(chat_id))
 
     def _voice_timeout_limit(self) -> int:
         return int(getattr(self, "_voice_timeout_seconds", self.VOICE_TIMEOUT))
@@ -3543,12 +4171,268 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         mixers = getattr(self, "_voice_mixers", None)
         return bool(mixers) and mixers.get(guild_id) is not None
 
+    @staticmethod
+    def _env_flag(name: str) -> bool:
+        return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _csv_env_values(*names: str) -> set[str]:
+        values: set[str] = set()
+        for name in names:
+            for item in os.environ.get(name, "").split(","):
+                item = item.strip()
+                if item:
+                    values.add(item)
+        return values
+
+    def _auto_voice_channel_ids(self) -> set[str]:
+        return self._csv_env_values(
+            "DISCORD_AUTO_VOICE_CHANNELS",
+            "DISCORD_AUTO_VOICE_CHANNEL",
+            "DISCORD_ALLOWED_VOICE_CHANNELS",
+        )
+
+    def _auto_voice_text_channel_id(self) -> Optional[int]:
+        raw = (
+            os.environ.get("DISCORD_AUTO_VOICE_TEXT_CHANNEL")
+            or os.environ.get("DISCORD_AUTO_VOICE_DM_CHANNEL")
+            or ""
+        ).strip()
+        if not raw:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            logger.warning("Invalid DISCORD_AUTO_VOICE_TEXT_CHANNEL=%r", raw)
+            return None
+
+    def _auto_voice_source_for_member(self, member, text_channel_id: int) -> Dict[str, Any]:
+        guild_id = str(getattr(getattr(member, "guild", None), "id", "") or "")
+        return {
+            "platform": Platform.DISCORD.value,
+            "chat_id": str(text_channel_id),
+            "chat_name": f"DM with {getattr(member, 'display_name', member.id)}",
+            "chat_type": "dm",
+            "user_id": str(member.id),
+            "user_name": str(getattr(member, "display_name", member.id)),
+            "scope_id": guild_id,
+            "guild_id": guild_id,
+        }
+
+    def _discord_voice_join_greeting_silent_channels(self) -> set[str]:
+        """Voice channels where the auto-join greeting must NOT fire.
+
+        Preserves marcion's per-channel silent-on-join intent (see
+        marcion-harness runbook: greeting only in namesake channel; stay
+        silent in shared rooms like bredren-voice). Config accepts a list,
+        tuple, set, or comma-separated string of channel names. Names are
+        normalised to lowercase for comparison. Missing / empty config
+        means "no channels are silent" (upstream behaviour: greet on every
+        auto-join).
+        """
+        raw = self._config_value("voice_join_greeting_silent_channels", None)
+        if raw is None:
+            return set()
+        if isinstance(raw, (list, tuple, set)):
+            items = raw
+        else:
+            items = str(raw).split(",")
+        return {str(item).strip().lower() for item in items if str(item).strip()}
+
+    def _discord_voice_namesake_greeting_enabled(self) -> bool:
+        value = self._config_value(
+            "voice_namesake_greeting_enabled",
+            None,
+            env_key="HERMES_DISCORD_VOICE_NAMESAKE_GREETING_ENABLED",
+        )
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"true", "1", "yes", "on"}
+
+    def _discord_voice_greeting_text(self, guild_id: int) -> str:
+        """Resolve the join greeting for a guild.
+
+        ``voice_join_greeting_text`` (apollo/marcion/muse) wins. Bumba's packet
+        uses the namesake keys instead: ``voice_namesake_greeting_message`` is
+        spoken only when ``voice_namesake_greeting_enabled`` is on and the
+        bot's current channel is in ``voice_namesake_greeting_channel_ids``
+        (an empty id list means every allowed channel is a namesake room).
+        """
+        greeting = str(self._config_value(
+            "voice_join_greeting_text",
+            "",
+            env_key="DISCORD_VOICE_JOIN_GREETING",
+        ) or "").strip()
+        if greeting or not self._discord_voice_namesake_greeting_enabled():
+            return greeting
+        vc = self._voice_clients.get(int(guild_id))
+        channel_id = str(getattr(getattr(vc, "channel", None), "id", "") or "")
+        namesake_ids = self._discord_voice_config_set(
+            "voice_namesake_greeting_channel_ids",
+            env_key="HERMES_DISCORD_VOICE_NAMESAKE_GREETING_CHANNEL_IDS",
+            guild_id=getattr(getattr(vc, "guild", None), "id", None),
+        )
+        if namesake_ids and channel_id.lower() not in namesake_ids:
+            logger.info(
+                "Voice greeting suppressed: channel=%s is not a namesake greeting channel",
+                channel_id or "?",
+            )
+            return ""
+        return str(self._config_value(
+            "voice_namesake_greeting_message",
+            "",
+            env_key="HERMES_DISCORD_VOICE_NAMESAKE_GREETING_MESSAGE",
+        ) or "").strip()
+
+    async def _speak_auto_voice_greeting(self, guild_id: int) -> bool:
+        greeting = self._discord_voice_greeting_text(int(guild_id))
+        if not greeting:
+            return False
+        audio_path = os.path.join(
+            tempfile.gettempdir(),
+            "hermes_voice",
+            f"auto_join_greeting_{guild_id}_{int(time.time() * 1000)}.mp3",
+        )
+        os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+        actual_paths: List[str] = []
+        try:
+            from tools.tts_tool import text_to_speech_tool
+
+            result_json = await asyncio.to_thread(
+                text_to_speech_tool, text=greeting, output_path=audio_path
+            )
+            result = json.loads(result_json)
+            actual_paths = result.get("file_paths") or [result.get("file_path", audio_path)]
+            actual_paths = [str(path) for path in actual_paths if path and os.path.isfile(path)]
+            if not result.get("success") or not actual_paths:
+                logger.warning("Auto voice greeting TTS failed: %s", result.get("error"))
+                return False
+            played = False
+            for path in actual_paths:
+                played = bool(await self.play_in_voice_channel(guild_id, path)) or played
+            return played
+        except Exception as e:
+            logger.warning("Auto voice greeting playback failed: %s", e, exc_info=True)
+            return False
+        finally:
+            for p in ({audio_path, *actual_paths} - {None}):
+                if p and os.path.isfile(p):
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+
+    async def _maybe_auto_leave_voice_channel(self, member, channel) -> bool:
+        """Leave an auto-joined VC when no authorized non-bot users remain."""
+        if channel is None or not self._discord_voice_auto_join_enabled():
+            return False
+        if not self._discord_voice_channel_allowed(channel):
+            return False
+        guild = getattr(member, "guild", None)
+        guild_id = int(getattr(guild, "id", 0) or 0)
+        if not guild_id or not self.is_in_voice_channel(guild_id):
+            return False
+        vc = self._voice_clients.get(guild_id)
+        if not vc or getattr(getattr(vc, "channel", None), "id", None) != getattr(channel, "id", None):
+            return False
+        allowed_auto_users = self._discord_voice_auto_join_users()
+        remaining_allowed_users = []
+        leaving_id = str(getattr(member, "id", ""))
+        for maybe_member in getattr(channel, "members", []) or []:
+            if getattr(maybe_member, "bot", False):
+                continue
+            user_id = str(getattr(maybe_member, "id", ""))
+            if user_id and user_id == leaving_id:
+                # Bumba packet: discord.py can expose stale channel.members
+                # during the leave event; the explicit before->after
+                # transition says this member is gone, so trust it.
+                continue
+            if allowed_auto_users and "*" not in allowed_auto_users and user_id not in allowed_auto_users:
+                continue
+            if self._is_allowed_user(
+                user_id,
+                author=maybe_member,
+                guild=getattr(maybe_member, "guild", guild),
+                is_dm=False,
+            ):
+                remaining_allowed_users.append(maybe_member)
+        if remaining_allowed_users:
+            return False
+        # P3 backport (2026-08-31): honor voice_empty_channel_timeout_seconds
+        # directly instead of deferring to the (much longer) inactivity timer —
+        # the intended behavior is "leave ~30s after Andrew leaves", which the
+        # newer trees (muse/apollo) already implement. Falls back to the old
+        # deferral when the key is unset.
+        _empty_timeout = self._config_value("voice_empty_channel_timeout_seconds", None)
+        if _empty_timeout is None:
+            # config.extra unexpectedly lacks this key at runtime even though
+            # sibling voice_* keys resolve (observed 2026-09-01; extra-builder
+            # question parked in the P3 notes). Read the source config directly
+            # so behavior does not depend on that mystery.
+            try:
+                import yaml as _yaml
+                _cfg_path = os.path.join(
+                    os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
+                    "config.yaml",
+                )
+                with open(_cfg_path, "r", encoding="utf-8") as _fh:
+                    _empty_timeout = (
+                        (_yaml.safe_load(_fh) or {}).get("discord", {}) or {}
+                    ).get("voice_empty_channel_timeout_seconds")
+                if _empty_timeout is not None:
+                    logger.info("Empty-channel timeout resolved from config.yaml fallback: %s", _empty_timeout)
+            except Exception:
+                _empty_timeout = None
+        try:
+            _empty_timeout = float(_empty_timeout) if _empty_timeout is not None else None
+        except (TypeError, ValueError):
+            _empty_timeout = None
+        if _empty_timeout is None or _empty_timeout <= 0:
+            logger.info("Voice auto-leave deferred to inactivity timeout: no allowed users remain in channel=%s guild=%s", getattr(channel, "id", None), guild_id)
+            self._reset_voice_timeout(guild_id)
+            return False
+        logger.info(
+            "Voice auto-leave scheduled in %.0fs (empty channel %s, guild %s)",
+            _empty_timeout, getattr(channel, "id", None), guild_id,
+        )
+
+        async def _empty_channel_leave() -> None:
+            await asyncio.sleep(_empty_timeout)
+            vc_now = self._voice_clients.get(guild_id)
+            if not vc_now or getattr(getattr(vc_now, "channel", None), "id", None) != getattr(channel, "id", None):
+                return  # already left or moved
+            for m in getattr(getattr(vc_now, "channel", None), "members", []) or []:
+                if getattr(m, "bot", False):
+                    continue
+                if self._is_allowed_user(
+                    str(getattr(m, "id", "")), author=m,
+                    guild=getattr(m, "guild", None), is_dm=False,
+                ):
+                    return  # an authorized user came back — stay
+            try:
+                await self.leave_voice_channel(guild_id)
+                logger.info("Voice auto-left empty channel %s after %.0fs", getattr(channel, "id", None), _empty_timeout)
+            except Exception:
+                logger.warning("Empty-channel auto-leave failed", exc_info=True)
+
+        asyncio.create_task(_empty_channel_leave())
+        return True
+
     async def join_voice_channel(self, channel, *, text_channel_id: int = None, source: dict = None) -> bool:
         """Join a voice channel; returns True on success. ``text_channel_id`` stores the
         transcription-routing binding so programmatic joins work without ``/voice join``."""
         if not self._client or not DISCORD_AVAILABLE:
             return False
         guild_id = channel.guild.id
+        if not self._discord_voice_channel_allowed(channel):
+            logger.warning(
+                "Refusing Discord voice join for disallowed channel %s (%s) in guild %s",
+                getattr(channel, "name", getattr(channel, "id", "?")),
+                getattr(channel, "id", "?"),
+                guild_id,
+            )
+            return False
+
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
             existing = self._voice_clients.get(guild_id)
             if existing and existing.is_connected():
@@ -3561,6 +4445,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             vc = await channel.connect()
             self._voice_clients[guild_id] = vc
             self._reset_voice_timeout(guild_id)
+            self._bumba_persist_voice_binding(guild_id, getattr(channel, "id", 0), text_channel_id)
+
+            # Store text-channel binding for automatic/programmatic joins
+            # so voice transcriptions can be routed without /voice join.
             if text_channel_id is not None:
                 self._voice_text_channels[guild_id] = text_channel_id
             if source is not None:
@@ -3584,6 +4472,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
     async def leave_voice_channel(self, guild_id: int) -> None:
         """Disconnect from the voice channel in a guild."""
+        # Bumba's shutdown guard: a gateway-shutdown leave must NOT drop the
+        # persisted binding — it is exactly what the on-ready reconcile needs
+        # to restore voice after the restart. Only user-driven leaves clear.
+        if not getattr(self, "_disconnecting", False):
+            self._clear_voice_binding(int(guild_id))
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
             receiver = self._voice_receivers.pop(guild_id, None)
             pending_inputs = []
@@ -3734,6 +4627,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     return
             except Exception:
                 pass
+        # Bumba packet: honor the fleet voice contract. Leave ONLY when the
+        # channel is empty of humans, not merely after silence; re-arm instead.
+        if self._bumba_voice_channel_has_human(guild_id):
+            logger.debug("Voice timeout re-armed: humans still present (guild=%d)", guild_id)
+            self._reset_voice_timeout(guild_id)
+            return
         await self.leave_voice_channel(guild_id)
         # Notify the runner so it can clean up voice_mode state
         if self._on_voice_disconnect and text_ch_id:
@@ -7323,6 +8222,41 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         if value is not None:
             seeded_extra[primary_key] = value
             if env_key:
+                _env_default(env_key, str(value))
+
+    # Discord live voice auto-join (fleet 969ac03fd2 + later voice packets). These remain opt-in because voice channels
+    # are sensitive in shared servers. Top-level ``discord:`` values win over
+    # ``discord.extra``; legacy env vars remain supported for non-YAML setups.
+    _voice_auto_join_keys = (
+        ("voice_auto_join", "DISCORD_VOICE_AUTO_JOIN"),
+        ("voice_auto_join_users", "DISCORD_VOICE_AUTO_JOIN_USERS"),
+        ("voice_auto_join_text_channel_id", "DISCORD_VOICE_AUTO_JOIN_TEXT_CHANNEL_ID"),
+        ("voice_allowed_channel_ids", "DISCORD_VOICE_ALLOWED_CHANNEL_IDS"),
+        ("voice_allowed_channel_names", "DISCORD_VOICE_ALLOWED_CHANNEL_NAMES"),
+        ("voice_denied_channel_ids", "DISCORD_VOICE_DENIED_CHANNEL_IDS"),
+        ("voice_denied_channel_names", "DISCORD_VOICE_DENIED_CHANNEL_NAMES"),
+        ("voice_join_greeting_text", "DISCORD_VOICE_JOIN_GREETING"),
+        ("voice_join_greeting_silent_channels", None),
+        ("voice_join_greeting_enabled", None),
+        # Bumba packet (2026-08-21) keys; without bridging, _config_value
+        # never sees them and the namesake greeting silently resolves empty.
+        ("voice_preferred_channel_id", "HERMES_DISCORD_VOICE_PREFERRED_CHANNEL_ID"),
+        ("voice_namesake_greeting_enabled", "HERMES_DISCORD_VOICE_NAMESAKE_GREETING_ENABLED"),
+        ("voice_namesake_greeting_channel_ids", "HERMES_DISCORD_VOICE_NAMESAKE_GREETING_CHANNEL_IDS"),
+        ("voice_namesake_greeting_message", "HERMES_DISCORD_VOICE_NAMESAKE_GREETING_MESSAGE"),
+        # B6 root-cause fix (2026-09-01): consumed via _config_value but never
+        # bridged into extra — empty-channel timer silently resolved None.
+        ("voice_empty_channel_timeout_seconds", None),
+        ("voice_channel_inactivity_timeout_seconds", None),
+    )
+    for key, env_key in _voice_auto_join_keys:
+        value = _websocket_liveness_cfg.get(key)
+        if value is not None:
+            seeded_extra[key] = value
+            if env_key:
+                if isinstance(value, (list, tuple, set)):
+                    value = ",".join(str(v) for v in value)
+                # _env_default = upstream's profile-scoped skip + don't-override-explicit-env setter
                 _env_default(env_key, str(value))
     return seeded_extra or None
 
