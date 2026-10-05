@@ -3860,7 +3860,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         try:
             self._persist_voice_binding(int(guild_id), int(voice_channel_id or 0), text_channel_id)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("[%s] Could not persist voice binding: %s", self.name, exc)
+            # No self.name here: it raises on half-built adapters (object.__new__ fixtures, early
+            # startup), which would turn a bookkeeping failure into a failed join (v2026.9.24 port).
+            logger.warning("[Discord] Could not persist voice binding: %s", exc)
 
     def _bumba_voice_channel_has_human(self, guild_id: int) -> bool:
         """True while a non-bot member other than this bot is in the bot's channel.
@@ -4370,15 +4372,13 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             # question parked in the P3 notes). Read the source config directly
             # so behavior does not depend on that mystery.
             try:
-                import yaml as _yaml
-                _cfg_path = os.path.join(
-                    os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
-                    "config.yaml",
-                )
-                with open(_cfg_path, "r", encoding="utf-8") as _fh:
-                    _empty_timeout = (
-                        (_yaml.safe_load(_fh) or {}).get("discord", {}) or {}
-                    ).get("voice_empty_channel_timeout_seconds")
+                # v2026.9.24 port: upstream forbids raw yaml.safe_load of config.yaml outside owner
+                # modules (tests/hermes_cli/test_config_read_guard.py); read_raw_config_readonly is
+                # the same no-defaults view of the active profile's config.yaml.
+                from hermes_cli.config import read_raw_config_readonly
+                _empty_timeout = (
+                    (read_raw_config_readonly() or {}).get("discord", {}) or {}
+                ).get("voice_empty_channel_timeout_seconds")
                 if _empty_timeout is not None:
                     logger.info("Empty-channel timeout resolved from config.yaml fallback: %s", _empty_timeout)
             except Exception:
