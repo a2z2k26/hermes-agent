@@ -188,3 +188,23 @@ class TestSessionDBIntegration:
         finally:
             os.chmod(db_path, 0o644)
             hermes_state._set_last_init_error(None)
+
+
+def test_sidecar_removed_mid_check_is_not_read_only(tmp_path, monkeypatch):
+    """Another connection's last close deletes ``-wal`` between the
+    ``is_file()`` scan and ``os.access``; ENOENT must not read as read-only
+    (live: factory router tick 2026-10-22 09:56)."""
+    db = tmp_path / "kanban.db"
+    _make_db(db)
+    wal = db.with_name(db.name + "-wal")
+    wal.write_bytes(b"")
+    real_access = os.access
+
+    def racing_access(p, mode, *a, **kw):
+        if Path(p) == wal and wal.exists():
+            wal.unlink()  # the other process closes its last connection now
+        return real_access(p, mode, *a, **kw)
+
+    monkeypatch.setattr(os, "access", racing_access)
+    preflight_db_writability(db, db_label="kanban.db")  # must not raise
+    assert not wal.exists()
