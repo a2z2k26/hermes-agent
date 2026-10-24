@@ -7186,15 +7186,25 @@ def _define_discord_view_classes() -> None:
                 except Exception:
                     pass  # message deleted or too old to edit
 
-        async def _finalize_embed(self, interaction: discord.Interaction, color, footer: str) -> None:
-            """Mark resolved, stamp the embed (color + footer), disable buttons, edit in place."""
+        def _finalize_state(self, interaction: discord.Interaction, color, footer: str):
+            """Mark resolved, stamp the embed, and disable every component."""
             self.resolved = True
             embed = self._first_embed(interaction.message)
             if embed:
                 embed.color = color
                 embed.set_footer(text=footer)
             self._disable_all()
+            return embed
+
+        async def _finalize_embed(self, interaction: discord.Interaction, color, footer: str) -> None:
+            """Finalize a component interaction that has not already been acknowledged."""
+            embed = self._finalize_state(interaction, color, footer)
             await interaction.response.edit_message(embed=embed, view=self)
+
+        async def _finalize_deferred_embed(self, interaction: discord.Interaction, color, footer: str) -> None:
+            """Finalize after ``response.defer()`` acknowledged the component interaction."""
+            embed = self._finalize_state(interaction, color, footer)
+            await interaction.edit_original_response(embed=embed, view=self)
 
         async def on_timeout(self):
             self.resolved = True
@@ -7252,8 +7262,12 @@ def _define_discord_view_classes() -> None:
             ):
                 return
             self.resolved = True
-            # Unblock the waiting agent thread FIRST. A click after the approval
-            # wait timed out (count == 0) must not claim "Approved".
+            # Discord requires a component acknowledgement within a few seconds. Do that before
+            # touching the cross-thread approval queue so a busy gateway cannot surface the
+            # client's generic "interaction failed" banner.
+            await interaction.response.defer()
+            # Unblock the waiting agent thread after the click is safely acknowledged. A click
+            # after the approval wait timed out (count == 0) must not claim "Approved".
             try:
                 from tools.approval import resolve_gateway_approval
                 count = resolve_gateway_approval(self.session_key, choice)
@@ -7267,7 +7281,7 @@ def _define_discord_view_classes() -> None:
             if not count:
                 color = discord.Color.dark_grey()
                 label = "⌛ Approval expired — command was not run (already timed out or resolved elsewhere)"
-            await self._finalize_embed(
+            await self._finalize_deferred_embed(
                 interaction, color, f"{label} by {interaction.user.display_name}" if count else label)
 
         @discord.ui.button(label="Allow Once", style=discord.ButtonStyle.green)
