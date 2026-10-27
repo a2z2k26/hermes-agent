@@ -7265,7 +7265,14 @@ def _define_discord_view_classes() -> None:
             # Discord requires a component acknowledgement within a few seconds. Do that before
             # touching the cross-thread approval queue so a busy gateway cannot surface the
             # client's generic "interaction failed" banner.
-            await interaction.response.defer()
+            try:
+                await interaction.response.defer()
+            except Exception as exc:
+                # No decision reached the approval queue. Permit another click unless the
+                # native view expired while acknowledgement was in flight.
+                self.resolved = self.is_finished()
+                logger.warning("Failed to acknowledge Discord approval button: %s", exc)
+                return
             # Unblock the waiting agent thread after the click is safely acknowledged. A click
             # after the approval wait timed out (count == 0) must not claim "Approved".
             try:
